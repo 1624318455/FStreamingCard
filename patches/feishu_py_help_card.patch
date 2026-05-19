@@ -1,0 +1,45 @@
+--- a/gateway/platforms/feishu.py (Hermes gateway)
++++ b/gateway/platforms/feishu.py (FStreamingCard patches)
+@@ Patch 1: line 2121 - ▶ button cmd regex fix @@
+- "cmd": cmd_name.split()[0],
++ "cmd": re.sub(r'\s*[\[<][^\]>]*[\]>]', '', cmd_name).strip(),
+
+@@ Patch 2: _dispatch_inbound_event - /help interception @@
+  async def _dispatch_inbound_event(self, event: MessageEvent) -> None:
+      """Apply Feishu-specific burst protection before entering the base adapter."""'
+      if event.message_type == MessageType.TEXT and not event.is_command():
+          await self._enqueue_text_event(event)
+          return
+      if self._should_batch_media_event(event):
+          await self._enqueue_media_event(event)
+          return
++     # Intercept /help -> send interactive card via sidecar
++     if event.is_command() and event.text.strip().lower().startswith("/help"):
++         if await self._forward_help_to_sidecar(event):
++             return
+      await self._handle_message_with_guards(event)
+
+@@ Patch 3: _forward_help_to_sidecar - new method @@
++    async def _forward_help_to_sidecar(self, event: MessageEvent) -> bool:
++        """Send interactive help card via sidecar /help endpoint. Returns True on success.""'
++        if aiohttp is None:
++            return False
++        chat_id = getattr(event.source, "chat_id", "") if event.source else ""
++        if not chat_id:
++            return False
++        sidecar_url = os.getenv("HERMES_FEISHU_CARD_EVENT_URL", "http://127.0.0.1:8765")
++        help_url = sidecar_url.rsplit("/events", 1)[0] + "/help"
++        try:
++            async with aiohttp.ClientSession() as session:
++                async with session.post(
++                    help_url,
++                    json={"chat_id": chat_id},
++                    timeout=aiohttp.ClientTimeout(total=3),
++                ) as resp:
++                    if resp.status == 200:
++                        body = await resp.json()
++                        if body.get("ok"):
++                            return True
++        except Exception:
++            pass
++        return False
