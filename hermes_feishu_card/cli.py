@@ -1,0 +1,1216 @@
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+import re
+import sys
+import time
+from uuid import uuid4
+from pathlib import Path
+
+import yaml
+
+from hermes_feishu_card.config import load_config
+from hermes_feishu_card.bots import BotRegistry
+from hermes_feishu_card.events import SidecarEvent
+from hermes_feishu_card.feishu_client import FeishuAPIError, FeishuClient, FeishuClientConfig
+from hermes_feishu_card.install.detect import HermesDetection, detect_hermes
+from hermes_feishu_card.install.manifest import file_sha256
+from hermes_feishu_card.install.patcher import (
+    apply_patch,
+    apply_cron_patch,
+    remove_patch,
+    remove_cron_patch,
+    remove_patch_lenient,
+)
+from hermes_feishu_card.process import start_sidecar, status_sidecar, stop_sidecar
+from hermes_feishu_card.render import render_card
+from hermes_feishu_card.session import CardSession
+
+
+BACKUP_SUFFIX = ".hermes_feishu_card.bak"
+MANIFEST_NAME = ".hermes_feishu_card_manifest"
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = _build_parser()
+    args = parser.parse_args(argv)
+
+    if args.command == "doctor":
+        return _run_doctor(args)
+    if args.command == "setup":
+        return _run_setup(args)
+    if args.command == "start":
+        return _run_start(args)
+    if args.command == "stop":
+        return _run_stop(args)
+    if args.command == "status":
+        return _run_status(args)
+    if args.command == "smoke-feishu-card":
+        return _run_smoke_feishu_card(args)
+    if args.command == "bots":
+        return _run_bots(args)
+    if args.command == "install":
+        return _run_install(args)
+    if args.command == "restore":
+        return _run_restore(args)
+    if args.command == "uninstall":
+        return _run_uninstall(args)
+
+    parser.print_help()
+    if argv == []:
+        return 0
+    return 2
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="hermes-feishu-card")
+    subparsers = parser.add_subparsers(dest="command")
+
+    doctor = subparsers.add_parser("doctor")
+    doctor.add_argument("--config", required=True)
+    doctor.add_argument("--hermes-dir")
+    doctor.add_argument("--skip-hermes", action="store_true")
+
+    setup = subparsers.add_parser(
+        "setup",
+        help="run the guided all-in-one installer for ordinary users",
+    )
+    setup.add_argument("--hermes-dir", required=True, help="Hermes Agent root directory")
+    setup.add_argument(
+        "--config",
+        default=str(Path.home() / ".hermes_feishu_card" / "config.yaml"),
+        help="sidecar config path to create or reuse",
+    )
+    setup.add_argument(
+        "--skip-start",
+        action="store_true",
+        help="install the Hermes hook but do not start the sidecar",
+    )
+    setup.add_argument(
+        "--yes",
+        action="store_true",
+        required=True,
+        help="confirm local Hermes hook installation",
+    )
+
+    for command in ("start", "stop", "status"):
+        process_parser = subparsers.add_parser(command)
+        process_parser.add_argument("--config", default="config.yaml.example")
+
+    smoke = subparsers.add_parser("smoke-feishu-card")
+    smoke.add_argument("--config", default="config.yaml.example")
+    smoke.add_argument("--chat-id", required=True)
+
+    bots = subparsers.add_parser("bots")
+    bot_subparsers = bots.add_subparsers(dest="bot_command")
+
+    bots_list = bot_subparsers.add_parser("list")
+    bots_list.add_argument("--config", required=True)
+
+    bots_add = bot_subparsers.add_parser("add")
+    bots_add.add_argument("bot_id")
+    bots_add.add_argument("--config", required=True)
+
+    bots_bind_chat = bot_subparsers.add_parser("bind-chat")
+    bots_bind_chat.add_argument("chat_id")
+    bots_bind_chat.add_argument("bot_id")
+    bots_bind_chat.add_argument("--config", required=True)
+
+    bots_unbind_chat = bot_subparsers.add_parser("unbind-chat")
+    bots_unbind_chat.add_argument("chat_id")
+    bots_unbind_chat.add_argument("--config", required=True)
+
+    bots_test = bot_subparsers.add_parser("test")
+    bots_test.add_argument("bot_id")
+    bots_test.add_argument("--chat-id", required=True)
+    bots_test.add_argument("--config", required=True)
+
+    for command in ("install", "restore", "uninstall"):
+        command_parser = subparsers.add_parser(command)
+        command_parser.add_argument("--hermes-dir", required=True)
+        command_parser.add_argument("--yes", action="store_true", required=True)
+    return parser
+
+
+def _run_setup(args: argparse.Namespace) -> int:
+    config_path = Path(args.config).expanduser()
+    try:
+        created = _ensure_setup_config(config_path)
+        config = load_config(config_path)
+    except Exception as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    print(f"config: {'created' if created else 'existing'} {config_path}")
+    if not _has_feishu_credentials(config):
+        print(
+            (
+                "error: Feishu credentials are required before setup installs "
+                "the Hermes hook. Set FEISHU_APP_ID and FEISHU_APP_SECRET, or "
+                f"fill feishu.app_id and feishu.app_secret in {config_path}."
+            ),
+            file=sys.stderr,
+        )
+        return 1
+
+    detection = detect_hermes(args.hermes_dir)
+    if not detection.supported:
+        print(_format_hermes_detection(detection), file=sys.stderr)
+        return 1
+    print("doctor: ok")
+    print(_format_hermes_detection(detection))
+    _print_hermes_streaming_guidance(Path(args.hermes_dir))
+
+    install_code = _run_install(
+        argparse.Namespace(hermes_dir=args.hermes_dir, yes=True)
+    )
+    if install_code != 0:
+        return install_code
+
+    if args.skip_start:
+        print("start: skipped")
+        print("setup ok")
+        return 0
+
+    try:
+        start_result = start_sidecar(config_path, config)
+    except Exception as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    if start_result.startswith("failed:"):
+        print(f"error: {start_result}", file=sys.stderr)
+        return 1
+    if start_result == "already running":
+        print("start: already running")
+    else:
+        print("start ok")
+
+    status = status_sidecar(config)
+    if not status["running"]:
+        print("error: sidecar did not report healthy status", file=sys.stderr)
+        return 1
+    print("status: running")
+    print(f"pid: {status['pid'] or 'unknown'}")
+    print("setup ok")
+    return 0
+
+
+def _has_feishu_credentials(config: dict[str, dict[str, object]]) -> bool:
+    feishu = config.get("feishu", {})
+    app_id = feishu.get("app_id", "")
+    app_secret = feishu.get("app_secret", "")
+    return bool(str(app_id).strip() and str(app_secret).strip())
+
+
+def _ensure_setup_config(config_path: Path) -> bool:
+    if config_path.exists():
+        return False
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    _atomic_write_text(config_path, _default_setup_config_text())
+    return True
+
+
+def _default_setup_config_text() -> str:
+    return """# Hermes Feishu Streaming Card V3.2 configuration
+# Prefer FEISHU_APP_ID and FEISHU_APP_SECRET environment variables in real deployments.
+
+server:
+  host: 127.0.0.1
+  port: 8765
+
+feishu:
+  app_id: ""
+  app_secret: ""
+  base_url: https://open.feishu.cn/open-apis
+  timeout_seconds: 30
+
+# V3.2 Multi-bot configuration.
+# For single-bot setups, leave `bots.items` empty and use `feishu.app_id`/`feishu.app_secret`.
+# For multi-bot, define each bot under `bots.items` and map chat IDs in `bindings.chats`.
+bots:
+  default: default
+  items: {}
+
+bindings:
+  fallback_bot: default
+  chats: {}
+  group_rules:
+    enabled: false  # V3.2 does not filter group triggers
+
+card:
+  title: Hermes Agent
+  max_wait_ms: 800
+  max_chars: 240
+  footer_fields:
+    - duration
+    - model
+    - input_tokens
+    - output_tokens
+    - context
+"""
+
+
+def _run_doctor(args: argparse.Namespace) -> int:
+    try:
+        config = load_config(args.config)
+    except Exception as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    host = config["server"]["host"]
+    port = config["server"]["port"]
+    print("doctor: ok")
+    print(f"sidecar: {host}:{port}")
+    if args.skip_hermes:
+        print("hermes: skipped")
+        return 0
+    if args.hermes_dir:
+        detection = detect_hermes(args.hermes_dir)
+        print(_format_hermes_detection(detection))
+        if detection.supported:
+            _print_hermes_streaming_guidance(Path(args.hermes_dir))
+        return 0 if detection.supported else 1
+    print("hermes: not checked")
+    return 0
+
+
+def _format_hermes_detection(detection: HermesDetection) -> str:
+    status = "supported" if detection.supported else "unsupported"
+    run_py_exists = "yes" if detection.run_py_exists else "no"
+    lines = [
+        f"hermes: {status}",
+        f"hermes_root: {detection.root}",
+        f"run_py: {detection.run_py}",
+        f"run_py_exists: {run_py_exists}",
+        f"cron_py: {detection.cron_py}",
+        f"cron_py_exists: {'yes' if detection.cron_py_exists else 'no'}",
+        f"version_source: {detection.version_source}",
+        f"version: {detection.version}",
+        f"minimum_supported_version: {detection.minimum_version}",
+        f"hook_strategy: {detection.hook_strategy}",
+        f"cron_hook_strategy: {detection.cron_hook_strategy}",
+        f"compatibility: {detection.compatibility}",
+        "anchors:",
+    ]
+    for capability, found in detection.capabilities.items():
+        anchor_status = "found" if found else "missing"
+        lines.append(f"  {capability}: {anchor_status}")
+    lines.append(f"reason: {detection.reason}")
+    return "\n".join(lines)
+
+
+def _print_hermes_streaming_guidance(hermes_root: Path) -> None:
+    config = _load_hermes_user_config(hermes_root)
+    status = _detect_hermes_streaming_status(config)
+    if status == "disabled":
+        print(
+            (
+                "warning: Hermes Gateway streaming appears disabled for Feishu. "
+                "Set streaming.enabled: true with streaming.transport: edit, "
+                "or set display.platforms.feishu.streaming: true, so "
+                "thinking.delta and answer.delta updates can reach the card."
+            )
+        )
+    elif status == "not_detected":
+        print(
+            (
+                "note: Hermes Gateway streaming config was not detected. If "
+                "cards do not show answer.delta updates, set "
+                "streaming.enabled: true and streaming.transport: edit in the "
+                "Hermes config.yaml."
+            )
+        )
+
+
+def _load_hermes_user_config(hermes_root: Path) -> dict[str, object]:
+    for config_path in _candidate_hermes_config_paths(hermes_root):
+        if not config_path.exists() or not config_path.is_file():
+            continue
+        try:
+            with config_path.open("r", encoding="utf-8") as file:
+                loaded = yaml.safe_load(file) or {}
+        except (OSError, UnicodeError, yaml.YAMLError):
+            continue
+        if isinstance(loaded, dict):
+            return loaded
+    return {}
+
+
+def _detect_hermes_streaming_status(config: dict[str, object]) -> str:
+    feishu_streaming = _nested_get(
+        config, ("display", "platforms", "feishu", "streaming")
+    )
+    if feishu_streaming is not None:
+        return "enabled" if _truthy(feishu_streaming) else "disabled"
+
+    streaming = config.get("streaming")
+    if not isinstance(streaming, dict):
+        return "not_detected"
+    if _truthy(streaming.get("enabled")) and str(
+        streaming.get("transport", "edit")
+    ).strip().lower() != "off":
+        return "enabled"
+    return "disabled"
+
+
+def _candidate_hermes_config_paths(hermes_root: Path) -> tuple[Path, ...]:
+    return (
+        hermes_root / "config.yaml",
+        hermes_root / "config.yml",
+        hermes_root / "configs" / "config.yaml",
+        hermes_root / "configs" / "config.yml",
+        Path.home() / ".hermes" / "config.yaml",
+        Path.home() / ".hermes" / "config.yml",
+    )
+
+
+def _nested_get(config: dict[str, object], path: tuple[str, ...]) -> object:
+    current: object = config
+    for key in path:
+        if not isinstance(current, dict) or key not in current:
+            return None
+        current = current[key]
+    return current
+
+
+def _truthy(value: object) -> bool:
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
+def _run_start(args: argparse.Namespace) -> int:
+    try:
+        config = load_config(args.config)
+    except Exception as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    try:
+        result = start_sidecar(args.config, config)
+    except Exception as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    if result.startswith("failed:"):
+        print(f"error: {result}", file=sys.stderr)
+        return 1
+    if result == "already running":
+        print("start: already running")
+        return 0
+    print("start ok")
+    return 0
+
+
+def _run_stop(args: argparse.Namespace) -> int:
+    try:
+        config = load_config(args.config)
+    except Exception as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    try:
+        result = stop_sidecar(config)
+    except Exception as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    if result.startswith("failed:"):
+        print(f"error: {result}", file=sys.stderr)
+        return 1
+    if result == "not running":
+        print("stop: not running")
+        return 0
+    print("stop ok")
+    return 0
+
+
+def _run_status(args: argparse.Namespace) -> int:
+    try:
+        config = load_config(args.config)
+    except Exception as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    status = status_sidecar(config)
+    if status["running"]:
+        print("status: running")
+        print(f"pid: {status['pid'] or 'unknown'}")
+        print(f"active_sessions: {status['health'].get('active_sessions', 0)}")
+        metrics = status["health"].get("metrics", {})
+        if isinstance(metrics, dict):
+            for name in (
+                "events_received",
+                "events_applied",
+                "events_ignored",
+                "events_rejected",
+                "feishu_send_attempts",
+                "feishu_send_successes",
+                "feishu_send_failures",
+                "feishu_update_attempts",
+                "feishu_update_successes",
+                "feishu_update_failures",
+                "feishu_update_retries",
+                "cron_cards_sent",
+                "cron_fallbacks",
+            ):
+                value = metrics.get(name)
+                if isinstance(value, int):
+                    print(f"{name}: {value}")
+    else:
+        print("status: stopped")
+        if status["pid"] is not None:
+            print(f"pid: {status['pid']} stale")
+    return 0
+
+
+def _run_smoke_feishu_card(args: argparse.Namespace) -> int:
+    try:
+        config = load_config(args.config)
+        message_id = asyncio.run(_smoke_feishu_card(config, args.chat_id))
+    except Exception as exc:
+        print(f"error: {_sanitize_error(exc, config if 'config' in locals() else None)}", file=sys.stderr)
+        return 1
+
+    print("smoke ok")
+    print(f"message_id: {message_id}")
+    return 0
+
+
+def _run_bots(args: argparse.Namespace) -> int:
+    try:
+        if args.bot_command == "list":
+            config = load_config(args.config)
+            registry = BotRegistry.from_config(config)
+            for bot in registry.list_bots():
+                print(f"{bot.bot_id}\t{bot.name}\t{bot.app_id}")
+            return 0
+
+        if args.bot_command == "add":
+            data = _read_local_yaml(args.config)
+            items = _ensure_mapping_path(data, "bots", "items")
+            if args.bot_id in items:
+                raise ValueError(f"bot {args.bot_id!r} already exists")
+            config = load_config(args.config)
+            if args.bot_id == "default" and _has_feishu_credentials(config):
+                raise ValueError("bot 'default' already exists")
+            items[args.bot_id] = {
+                "name": args.bot_id,
+                "app_id": "",
+                "app_secret": "",
+                "base_url": FeishuClientConfig.base_url,
+                "timeout_seconds": FeishuClientConfig.timeout_seconds,
+            }
+            _write_local_yaml(args.config, data)
+            print(f"bot added: {args.bot_id}")
+            return 0
+
+        if args.bot_command == "bind-chat":
+            config = load_config(args.config)
+            if not _config_has_bot(config, args.bot_id):
+                raise KeyError(f"unknown bot: {args.bot_id}")
+            data = _read_local_yaml(args.config)
+            chats = _ensure_mapping_path(data, "bindings", "chats")
+            chats[args.chat_id] = args.bot_id
+            _write_local_yaml(args.config, data)
+            print(f"bound: {args.chat_id} -> {args.bot_id}")
+            return 0
+
+        if args.bot_command == "unbind-chat":
+            data = _read_local_yaml(args.config)
+            chats = _ensure_mapping_path(data, "bindings", "chats")
+            chats.pop(args.chat_id, None)
+            _write_local_yaml(args.config, data)
+            print(f"unbound: {args.chat_id}")
+            return 0
+
+        if args.bot_command == "test":
+            config = load_config(args.config)
+            message_id = asyncio.run(
+                _smoke_feishu_card_with_bot(config, args.bot_id, args.chat_id)
+            )
+            print("bot smoke ok")
+            print(f"message_id: {message_id}")
+            return 0
+    except Exception as exc:
+        print(f"error: {_sanitize_error(exc, locals().get('config'))}", file=sys.stderr)
+        return 1
+
+    print("error: bots command is required", file=sys.stderr)
+    return 2
+
+
+def _read_local_yaml(path: str | Path) -> dict:
+    config_path = Path(path).expanduser()
+    if not config_path.exists():
+        return {}
+    with config_path.open("r", encoding="utf-8") as handle:
+        loaded = yaml.safe_load(handle)
+    if loaded is None:
+        return {}
+    if not isinstance(loaded, dict):
+        raise ValueError("Config top-level YAML value must be a mapping")
+    return loaded
+
+
+def _write_local_yaml(path: str | Path, data: dict) -> None:
+    config_path = Path(path).expanduser()
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    _atomic_write_text(
+        config_path,
+        yaml.safe_dump(data, sort_keys=False, allow_unicode=True),
+    )
+
+
+def _ensure_mapping_path(data: dict, *path: str) -> dict:
+    current = data
+    for key in path:
+        value = current.get(key)
+        if value is None:
+            value = {}
+            current[key] = value
+        if not isinstance(value, dict):
+            raise ValueError(f"Config section {'.'.join(path)} must be a mapping")
+        current = value
+    return current
+
+
+def _config_has_bot(config: dict, bot_id: str) -> bool:
+    bots = config.get("bots")
+    if isinstance(bots, dict):
+        items = bots.get("items")
+        if isinstance(items, dict) and bot_id in items:
+            return True
+    return bot_id == "default" and _has_feishu_credentials(config)
+
+
+async def _smoke_feishu_card_with_bot(config: dict, bot_id: str, chat_id: str) -> str:
+    registry = BotRegistry.from_config(config)
+    bot = registry.get(bot_id)
+    bot_config = dict(config)
+    bot_config["feishu"] = {
+        "app_id": bot.app_id,
+        "app_secret": bot.app_secret,
+        "base_url": bot.base_url,
+        "timeout_seconds": bot.timeout_seconds,
+    }
+    return await _smoke_feishu_card(bot_config, chat_id)
+
+
+async def _smoke_feishu_card(config: dict, chat_id: str) -> str:
+    feishu = config.get("feishu", {})
+    app_id = feishu.get("app_id", "")
+    app_secret = feishu.get("app_secret", "")
+    if not isinstance(chat_id, str) or not chat_id.strip():
+        raise ValueError("chat_id is required")
+    if not app_id or not app_secret:
+        raise ValueError("FEISHU_APP_ID and FEISHU_APP_SECRET are required")
+
+    client = FeishuClient(
+        FeishuClientConfig(
+            app_id=app_id,
+            app_secret=app_secret,
+            base_url=feishu.get("base_url", FeishuClientConfig.base_url),
+            timeout_seconds=feishu.get(
+                "timeout_seconds",
+                FeishuClientConfig.timeout_seconds,
+            ),
+        )
+    )
+    session = CardSession(
+        conversation_id="smoke",
+        message_id=f"smoke-{uuid4().hex}",
+        chat_id=chat_id,
+        thinking_text="飞书卡片 smoke test 正在运行。",
+    )
+    card_config = config.get("card", {})
+    title = card_config.get("title", "Hermes Agent")
+    footer_fields = card_config.get("footer_fields")
+    if not isinstance(footer_fields, list):
+        footer_fields = None
+    message_id = await client.send_card(
+        chat_id,
+        render_card(session, footer_fields=footer_fields, title=title),
+    )
+
+    completed = SidecarEvent(
+        schema_version="1",
+        event="message.completed",
+        conversation_id=session.conversation_id,
+        message_id=session.message_id,
+        chat_id=session.chat_id,
+        platform="feishu",
+        sequence=0,
+        created_at=time.time(),
+        data={
+            "answer": "飞书卡片 smoke test 已完成。",
+            "duration": 0.1,
+            "tokens": {"input_tokens": 0, "output_tokens": 0},
+        },
+    )
+    session.apply(completed)
+    await client.update_card_message(
+        message_id,
+        render_card(session, footer_fields=footer_fields, title=title),
+    )
+    return message_id
+
+
+def _sanitize_error(exc: Exception, config: dict | None) -> str:
+    message = str(exc)
+    for secret in _secret_values(config):
+        if secret:
+            message = message.replace(secret, "[redacted]")
+    message = re.sub(r"Bearer\s+[A-Za-z0-9._~+/=-]+", "[redacted-auth]", message)
+    message = re.sub(r"tenant-token-[A-Za-z0-9._~+/=-]+", "tenant-token-[redacted]", message)
+    if isinstance(exc, FeishuAPIError):
+        return message
+    return message or exc.__class__.__name__
+
+
+def _secret_values(config: dict | None) -> list[str]:
+    if not isinstance(config, dict):
+        return []
+    secrets: list[str] = []
+    feishu = config.get("feishu")
+    if isinstance(feishu, dict) and isinstance(feishu.get("app_secret"), str):
+        secrets.append(feishu["app_secret"])
+    bots = config.get("bots")
+    if isinstance(bots, dict):
+        items = bots.get("items")
+        if isinstance(items, dict):
+            for value in items.values():
+                if isinstance(value, dict) and isinstance(value.get("app_secret"), str):
+                    secrets.append(value["app_secret"])
+    return secrets
+
+
+def _run_install(args: argparse.Namespace) -> int:
+    detection = detect_hermes(args.hermes_dir)
+    if not detection.supported:
+        print(_format_hermes_detection(detection), file=sys.stderr)
+        return 1
+
+    run_py = detection.run_py
+    backup_path = _backup_path(run_py)
+    cron_py = detection.cron_py if detection.cron_py_exists else None
+    cron_backup_path = _backup_path(cron_py) if cron_py is not None else None
+    manifest_path = _manifest_path(detection.root)
+    original: str | None = None
+    cron_original: str | None = None
+    manifest_existed = manifest_path.exists()
+    backup_existed = backup_path.exists()
+    cron_backup_existed = bool(cron_backup_path and cron_backup_path.exists())
+
+    try:
+        original = _read_text_preserve_newlines(run_py)
+        cron_original = (
+            _read_text_preserve_newlines(cron_py) if cron_py is not None else None
+        )
+        _validate_existing_install_state(
+            run_py,
+            backup_path,
+            manifest_path,
+            cron_py=cron_py,
+            cron_backup_path=cron_backup_path,
+        )
+        patched = apply_patch(
+            original, strategy=detection.hook_strategy or "legacy_gateway_run"
+        )
+        cron_patched = (
+            apply_cron_patch(cron_original)
+            if cron_py is not None and cron_original is not None
+            else None
+        )
+        if not backup_existed:
+            _atomic_write_text(backup_path, original)
+        if cron_py is not None and cron_backup_path is not None and not cron_backup_existed:
+            _atomic_write_text(cron_backup_path, cron_original or "")
+        if patched != original:
+            _atomic_write_text(run_py, patched)
+        if (
+            cron_py is not None
+            and cron_patched is not None
+            and cron_original is not None
+            and cron_patched != cron_original
+        ):
+            _atomic_write_text(cron_py, cron_patched)
+        _write_manifest(manifest_path, run_py, backup_path, cron_py, cron_backup_path)
+    except (OSError, UnicodeError, ValueError) as exc:
+        _rollback_install(
+            run_py,
+            original,
+            backup_path,
+            backup_existed,
+            manifest_path,
+            manifest_existed,
+            cron_py=cron_py,
+            cron_original=cron_original,
+            cron_backup_path=cron_backup_path,
+            cron_backup_existed=cron_backup_existed,
+        )
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    print("install ok")
+    return 0
+
+
+def _run_restore(args: argparse.Namespace) -> int:
+    try:
+        _restore(Path(args.hermes_dir))
+    except (OSError, UnicodeError, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    print("restore ok")
+    return 0
+
+
+def _run_uninstall(args: argparse.Namespace) -> int:
+    try:
+        _restore(Path(args.hermes_dir))
+    except (OSError, UnicodeError, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    print("uninstall ok")
+    return 0
+
+
+def _restore(hermes_root: Path) -> None:
+    run_py = hermes_root / "gateway" / "run.py"
+    cron_py = hermes_root / "cron" / "scheduler.py"
+    backup_path = _backup_path(run_py)
+    cron_backup_path = _backup_path(cron_py)
+    manifest_path = _manifest_path(hermes_root)
+    if run_py.is_symlink():
+        raise ValueError("gateway/run.py must not be a symlink")
+    if backup_path.exists():
+        manifest = _read_manifest(manifest_path)
+        if manifest is None:
+            backup_text = _read_text_preserve_newlines(backup_path)
+            _validate_backup_contains_original(backup_text, "restore")
+            if run_py.exists() and _read_text_preserve_newlines(run_py) == backup_text:
+                _clear_install_state(backup_path, manifest_path)
+                return
+
+            current = _read_text_preserve_newlines(run_py) if run_py.exists() else ""
+            try:
+                if run_py.exists() and remove_patch(current) == backup_text:
+                    _atomic_write_text(run_py, backup_text)
+                    _clear_install_state(backup_path, manifest_path)
+                    return
+            except ValueError:
+                pass
+
+            patched_backup = apply_patch(backup_text)
+            if not run_py.exists() or current != patched_backup:
+                raise ValueError("run.py changed since install; refusing to restore")
+
+            _atomic_write_text(run_py, backup_text)
+            _clear_install_state(backup_path, manifest_path)
+            return
+
+        backup_text = _validate_restorable_install_state(
+            run_py,
+            backup_path,
+            manifest,
+            "restore",
+            cron_py=cron_py,
+            cron_backup_path=cron_backup_path,
+        )
+        cron_backup_text = (
+            _read_text_preserve_newlines(cron_backup_path)
+            if _manifest_has_cron(manifest) and cron_backup_path.exists()
+            else None
+        )
+        _atomic_write_text(run_py, backup_text)
+        if cron_backup_text is not None:
+            _atomic_write_text(cron_py, cron_backup_text)
+        _clear_install_state(backup_path, manifest_path)
+        return
+    if not run_py.exists():
+        return
+
+    current = _read_text_preserve_newlines(run_py)
+    if manifest_path.exists() and remove_patch(current) == current:
+        _clear_install_state(backup_path, manifest_path)
+        return
+
+    manifest = _read_manifest(manifest_path)
+    if manifest is not None:
+        patched_sha256 = manifest.get("patched_sha256")
+        if not isinstance(patched_sha256, str) or not patched_sha256:
+            if remove_patch(current) != current:
+                raise ValueError("manifest missing patched run.py sha256")
+        elif file_sha256(run_py) != patched_sha256:
+            raise ValueError("run.py changed since install; refusing to restore")
+
+    restored = _restore_by_removing_owned_patch(run_py, current)
+    if restored or backup_path.exists() or manifest_path.exists():
+        _clear_install_state(backup_path, manifest_path)
+
+
+def _backup_path(run_py: Path) -> Path:
+    return run_py.with_name(f"{run_py.name}{BACKUP_SUFFIX}")
+
+
+def _manifest_path(hermes_root: Path) -> Path:
+    return hermes_root / MANIFEST_NAME
+
+
+def _clear_install_state(backup_path: Path, manifest_path: Path) -> None:
+    backup_path.unlink(missing_ok=True)
+    cron_backup_path = backup_path.parent.parent / "cron" / f"scheduler.py{BACKUP_SUFFIX}"
+    cron_backup_path.unlink(missing_ok=True)
+    manifest_path.unlink(missing_ok=True)
+
+
+def _write_manifest(
+    manifest_path: Path,
+    run_py: Path,
+    backup_path: Path,
+    cron_py: Path | None = None,
+    cron_backup_path: Path | None = None,
+) -> None:
+    manifest = {
+        "run_py": str(run_py.relative_to(manifest_path.parent)),
+        "patched_sha256": file_sha256(run_py),
+        "backup": str(backup_path.relative_to(manifest_path.parent)),
+        "backup_sha256": file_sha256(backup_path),
+    }
+    if cron_py is not None and cron_backup_path is not None and cron_py.exists():
+        manifest.update(
+            {
+                "cron_py": str(cron_py.relative_to(manifest_path.parent)),
+                "cron_patched_sha256": file_sha256(cron_py),
+                "cron_backup": str(cron_backup_path.relative_to(manifest_path.parent)),
+                "cron_backup_sha256": file_sha256(cron_backup_path),
+            }
+        )
+    _atomic_write_text(manifest_path, json.dumps(manifest, sort_keys=True) + "\n")
+
+
+def _rollback_install(
+    run_py: Path,
+    original: str | None,
+    backup_path: Path,
+    backup_existed: bool,
+    manifest_path: Path,
+    manifest_existed: bool,
+    *,
+    cron_py: Path | None = None,
+    cron_original: str | None = None,
+    cron_backup_path: Path | None = None,
+    cron_backup_existed: bool = False,
+) -> None:
+    if original is not None:
+        try:
+            _atomic_write_text(run_py, original)
+        except OSError:
+            pass
+    if cron_py is not None and cron_original is not None:
+        try:
+            _atomic_write_text(cron_py, cron_original)
+        except OSError:
+            pass
+    if not backup_existed:
+        try:
+            backup_path.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
+    if cron_backup_path is not None and not cron_backup_existed:
+        try:
+            cron_backup_path.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
+    if not manifest_existed:
+        try:
+            manifest_path.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
+
+
+def _validate_existing_install_state(
+    run_py: Path,
+    backup_path: Path,
+    manifest_path: Path,
+    *,
+    cron_py: Path | None = None,
+    cron_backup_path: Path | None = None,
+) -> None:
+    backup_exists = backup_path.exists()
+    manifest_exists = manifest_path.exists()
+    current = _read_text_preserve_newlines(run_py)
+
+    if not backup_exists and not manifest_exists:
+        if remove_patch(current) != current:
+            raise ValueError(
+                "install state incomplete; run.py already contains patch; "
+                "restore or remove patch before installing"
+            )
+        _validate_cron_install_state_without_manifest(cron_py, cron_backup_path)
+        return
+
+    if backup_exists and not manifest_exists:
+        raise ValueError(
+            "install state incomplete; manifest missing; "
+            "restore or remove patch before installing"
+        )
+
+    if not backup_exists:
+        manifest = _read_manifest(manifest_path)
+        _validate_manifest_matches_run_py(run_py, manifest)
+        raise ValueError("install state incomplete; backup missing; refusing to install")
+
+    manifest = _read_manifest(manifest_path)
+    try:
+        _validate_complete_install_state(
+            run_py,
+            backup_path,
+            manifest,
+            "install",
+            cron_py=cron_py,
+            cron_backup_path=cron_backup_path,
+        )
+    except ValueError as exc:
+        if "run.py changed since install" not in str(
+            exc
+        ) or not _current_matches_backup_lenient(run_py, backup_path):
+            raise
+
+
+def _validate_manifest_matches_run_py(
+    run_py: Path, manifest: dict[str, object] | None
+) -> None:
+    if manifest is None:
+        return
+    patched_sha256 = manifest.get("patched_sha256")
+    if not isinstance(patched_sha256, str) or not patched_sha256:
+        raise ValueError("manifest missing patched run.py sha256")
+    if file_sha256(run_py) != patched_sha256:
+        raise ValueError("run.py changed since install; refusing to install")
+
+
+def _validate_complete_install_state(
+    run_py: Path,
+    backup_path: Path,
+    manifest: dict[str, object] | None,
+    operation: str,
+    *,
+    cron_py: Path | None = None,
+    cron_backup_path: Path | None = None,
+) -> str:
+    if manifest is None:
+        backup_text = _read_text_preserve_newlines(backup_path)
+        _validate_backup_contains_original(backup_text, operation)
+        if not run_py.exists():
+            raise ValueError(f"run.py changed since install; refusing to {operation}")
+        _validate_current_matches_backup(_read_text_preserve_newlines(run_py), backup_text, operation)
+        return backup_text
+
+    patched_sha256 = manifest.get("patched_sha256")
+    if not isinstance(patched_sha256, str) or not patched_sha256:
+        raise ValueError("manifest missing patched run.py sha256")
+    if file_sha256(run_py) != patched_sha256:
+        raise ValueError(f"run.py changed since install; refusing to {operation}")
+
+    backup_sha256 = manifest.get("backup_sha256")
+    if not isinstance(backup_sha256, str) or not backup_sha256:
+        raise ValueError("manifest missing backup sha256")
+    if file_sha256(backup_path) != backup_sha256:
+        raise ValueError(f"backup changed since install; refusing to {operation}")
+
+    current = _read_text_preserve_newlines(run_py)
+    backup_text = _read_text_preserve_newlines(backup_path)
+    _validate_backup_contains_original(backup_text, operation)
+    _validate_current_matches_backup(current, backup_text, operation)
+    _validate_complete_cron_install_state(
+        cron_py, cron_backup_path, manifest, operation
+    )
+    return backup_text
+
+
+def _validate_restorable_install_state(
+    run_py: Path,
+    backup_path: Path,
+    manifest: dict[str, object],
+    operation: str,
+    *,
+    cron_py: Path | None = None,
+    cron_backup_path: Path | None = None,
+) -> str:
+    backup_sha256 = manifest.get("backup_sha256")
+    if not isinstance(backup_sha256, str) or not backup_sha256:
+        raise ValueError("manifest missing backup sha256")
+    if file_sha256(backup_path) != backup_sha256:
+        raise ValueError(f"backup changed since install; refusing to {operation}")
+
+    backup_text = _read_text_preserve_newlines(backup_path)
+    _validate_backup_contains_original(backup_text, operation)
+    if not run_py.exists():
+        raise ValueError(f"run.py changed since install; refusing to {operation}")
+
+    current = _read_text_preserve_newlines(run_py)
+    if current == backup_text:
+        return backup_text
+
+    patched_sha256 = manifest.get("patched_sha256")
+    if not isinstance(patched_sha256, str) or not patched_sha256:
+        raise ValueError("manifest missing patched run.py sha256")
+    if file_sha256(run_py) != patched_sha256:
+        raise ValueError(f"run.py changed since install; refusing to {operation}")
+
+    _validate_current_matches_backup(current, backup_text, operation)
+    _validate_complete_cron_install_state(
+        cron_py, cron_backup_path, manifest, operation
+    )
+    return backup_text
+
+
+def _validate_cron_install_state_without_manifest(
+    cron_py: Path | None, cron_backup_path: Path | None
+) -> None:
+    if cron_py is None:
+        return
+    if cron_backup_path is not None and cron_backup_path.exists():
+        raise ValueError(
+            "install state incomplete; cron backup exists without manifest; "
+            "restore or remove patch before installing"
+        )
+    if cron_py.exists():
+        current_cron = _read_text_preserve_newlines(cron_py)
+        if remove_cron_patch(current_cron) == current_cron:
+            return
+        raise ValueError(
+            "install state incomplete; cron scheduler already contains patch; "
+            "restore or remove patch before installing"
+        )
+
+
+def _validate_complete_cron_install_state(
+    cron_py: Path | None,
+    cron_backup_path: Path | None,
+    manifest: dict[str, object] | None,
+    operation: str,
+) -> None:
+    if manifest is None or not _manifest_has_cron(manifest):
+        return
+    if cron_py is None or cron_backup_path is None:
+        raise ValueError(f"cron scheduler changed since install; refusing to {operation}")
+    if not cron_py.exists():
+        raise ValueError(f"cron scheduler changed since install; refusing to {operation}")
+    if not cron_backup_path.exists():
+        raise ValueError(f"cron backup changed since install; refusing to {operation}")
+
+    cron_patched_sha256 = manifest.get("cron_patched_sha256")
+    if not isinstance(cron_patched_sha256, str) or not cron_patched_sha256:
+        raise ValueError("manifest missing cron patched sha256")
+    if file_sha256(cron_py) != cron_patched_sha256:
+        raise ValueError(f"cron scheduler changed since install; refusing to {operation}")
+
+    cron_backup_sha256 = manifest.get("cron_backup_sha256")
+    if not isinstance(cron_backup_sha256, str) or not cron_backup_sha256:
+        raise ValueError("manifest missing cron backup sha256")
+    if file_sha256(cron_backup_path) != cron_backup_sha256:
+        raise ValueError(f"cron backup changed since install; refusing to {operation}")
+
+    cron_current = _read_text_preserve_newlines(cron_py)
+    cron_backup_text = _read_text_preserve_newlines(cron_backup_path)
+    if remove_cron_patch(cron_backup_text) != cron_backup_text:
+        raise ValueError(f"cron backup changed since install; refusing to {operation}")
+    try:
+        restored_cron = remove_cron_patch(cron_current)
+    except ValueError as exc:
+        raise ValueError(
+            f"cron scheduler changed since install; refusing to {operation}"
+        ) from exc
+    if restored_cron != cron_backup_text:
+        raise ValueError(f"cron scheduler changed since install; refusing to {operation}")
+
+
+def _manifest_has_cron(manifest: dict[str, object]) -> bool:
+    return "cron_py" in manifest or "cron_patched_sha256" in manifest
+
+
+def _validate_backup_contains_original(backup_text: str, operation: str) -> None:
+    if remove_patch(backup_text) != backup_text:
+        raise ValueError(f"backup changed since install; refusing to {operation}")
+
+
+def _validate_current_matches_backup(
+    current: str, backup_text: str, operation: str
+) -> None:
+    try:
+        restored_current = remove_patch(current)
+    except ValueError as exc:
+        raise ValueError(
+            f"run.py changed since install; refusing to {operation}"
+        ) from exc
+    if restored_current != backup_text:
+        raise ValueError(f"run.py changed since install; refusing to {operation}")
+
+
+def _current_matches_backup_lenient(run_py: Path, backup_path: Path) -> bool:
+    try:
+        current = _read_text_preserve_newlines(run_py)
+        backup_text = _read_text_preserve_newlines(backup_path)
+        _validate_backup_contains_original(backup_text, "install")
+        return remove_patch_lenient(current) == backup_text
+    except (OSError, UnicodeError, ValueError):
+        return False
+
+
+def _read_manifest(manifest_path: Path) -> dict[str, object] | None:
+    if not manifest_path.exists():
+        return None
+    try:
+        manifest = json.loads(_read_text_preserve_newlines(manifest_path))
+    except json.JSONDecodeError as exc:
+        raise ValueError("manifest could not be parsed") from exc
+    if not isinstance(manifest, dict):
+        raise ValueError("manifest could not be parsed")
+    return manifest
+
+
+def _read_text_preserve_newlines(path: Path) -> str:
+    with path.open("r", encoding="utf-8", newline="") as handle:
+        return handle.read()
+
+
+def _atomic_write_text(path: Path, contents: str) -> None:
+    temp_path = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
+    try:
+        with temp_path.open("w", encoding="utf-8", newline="") as handle:
+            handle.write(contents)
+        temp_path.replace(path)
+    finally:
+        try:
+            temp_path.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
+
+
+def _restore_by_removing_owned_patch(run_py: Path, current: str | None = None) -> bool:
+    if not run_py.exists():
+        return False
+    if current is None:
+        current = _read_text_preserve_newlines(run_py)
+    restored = remove_patch(current)
+    if restored == current:
+        return False
+    _atomic_write_text(run_py, restored)
+    return True
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

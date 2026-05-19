@@ -1,14 +1,18 @@
 # Python
 __pycache__/
 *.py[cod]
+*.pyo
+*.bak
+*.fscbak
 *.egg-info/
 dist/
 build/
 
 # Environment
 .env
-*.venv/
+.venv/
 venv/
+env/
 
 # IDE
 .vscode/
@@ -21,3 +25,7 @@ Thumbs.db
 # Sidecar
 *.log
 output/
+
+# Tools
+.superpowers/
+.worktrees/
