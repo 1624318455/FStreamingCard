@@ -245,48 +245,9 @@ async def _apply_event_locked(app, session_key, event, session):
 
 ### Phase 2 — 交互帮助卡片
 
-#### 2.1 server.py 加路由
+#### 2.1 完整命令数据和 Tab 分类
 
-```python
-app.router.add_post("/card_action", handle_card_action)
-```
-
-#### 2.2 card_action.py（新增）
-
-移植 `feishu-interactive-help-card` SKILL 中的逻辑：
-
-```python
-async def handle_card_action(request: web.Request) -> web.Response:
-    """处理帮助卡片的按钮点击（Tab 切换 + ▶ 命令执行）。"""
-    payload = await request.json()
-    action_value = payload.get("value", {})
-    help_action = action_value.get("help_action")
-    
-    if help_action == "help_tab":
-        tab_name = action_value.get("tab", "chat")
-        card = build_help_card(tab=tab_name)
-        return web.json_response({"card": card, "action": "replace"})
-    
-    elif help_action == "help_cmd":
-        cmd = action_value.get("cmd", "")
-        # 通过 gateway API 注入命令
-        await inject_command(request, cmd)
-        loading_card = build_help_loading_response(cmd=cmd)
-        return web.json_response({"card": loading_card, "action": "replace"})
-    
-    return web.json_response({"action": "none"})
-```
-
-#### 2.3 Tab 分类
-
-| Key | 标签 | 命令数 | 内容 |
-|-----|------|--------|------|
-| `chat` | 💬 对话命令 | 22 | `/new`, `/list`, `/switch`, `/retry`, `/help`… |
-| `cli` | ⚙️ CLI 配置 | 16 | `hermes config`, `hermes setup`, `/model`… |
-| `ext` | 🧩 技能与扩展 | 13 | `/skill`, `hermes skills`, `/reload-mcp`… |
-| `infra` | 🌐 平台与自动化 | 15 | `hermes gateway`, `/cron`, `/platforms`… |
-
-#### 2.4 卡片模板
+`card_action.py` 中定义：
 
 ```python
 _HELP_TABS_CN = {
@@ -296,73 +257,344 @@ _HELP_TABS_CN = {
     "infra": "🌐 平台与自动化",
 }
 
+_HELP_COMMANDS = {
+    "chat": [
+        ("/new [名称]", "创建新会话"),
+        ("/list", "列出所有会话"),
+        ("/switch <序号>", "切换会话"),
+        ("/current", "查看当前会话"),
+        ("/search <关键词>", "搜索会话"),
+        ("/history [n]", "最近 n 条消息"),
+        ("/delete <序号>", "删除会话"),
+        ("/name [序号] <名称>", "会话命名"),
+        ("/title [名称]", "设定标题"),
+        ("/resume [名称]", "恢复会话"),
+        ("/agents", "活跃 Agent / 任务"),
+        ("/branch", "分支会话"),
+        ("/retry", "重发上一条"),
+        ("/undo", "撤销上一条"),
+        ("/compress", "手动压缩上下文"),
+        ("/rollback [N]", "恢复检查点"),
+        ("/background <prompt>", "后台执行"),
+        ("/help", "显示命令"),
+        ("/usage", "Token 用量"),
+        ("/status", "会话信息"),
+        ("/profile", "当前 Profile"),
+        ("/debug", "上传调试报告"),
+    ],
+    "cli": [
+        ("hermes config", "查看配置"),
+        ("hermes config set KEY VAL", "设置配置"),
+        ("hermes config path", "配置路径"),
+        ("hermes model", "选择模型/提供商"),
+        ("hermes setup [section]", "设置向导"),
+        ("hermes doctor [--fix]", "检查依赖"),
+        ("hermes login [--provider P]", "OAuth 登录"),
+        ("/model [名称]", "切换模型"),
+        ("/reasoning [级别]", "推理深度"),
+        ("/voice [on|off|tts]", "语音模式"),
+        ("/yolo", "跳过审批"),
+        ("/personality [名称]", "人格设置"),
+        ("/verbose", "详细输出"),
+        ("/config", "显示配置"),
+        ("hermes profile list", "Profile 管理"),
+        ("hermes sessions list", "会话管理"),
+    ],
+    "ext": [
+        ("/skill <名称>", "加载 Skill"),
+        ("hermes skills list", "列出 Skills"),
+        ("hermes skills install ID", "安装 Skill"),
+        ("hermes skills search QUERY", "搜索 Skill"),
+        ("/tools", "工具管理"),
+        ("hermes tools", "交互式工具开关"),
+        ("/toolsets", "列出工具集"),
+        ("/reload-skills", "重扫 Skills"),
+        ("/reload-mcp", "重载 MCP"),
+        ("/plugins", "插件列表"),
+        ("/curator", "Skill 维护"),
+        ("hermes mcp list", "MCP 管理"),
+        ("hermes plugins list", "插件管理"),
+    ],
+    "infra": [
+        ("hermes gateway run", "启动网关"),
+        ("hermes gateway start", "启动服务"),
+        ("hermes gateway stop", "停止服务"),
+        ("hermes gateway restart", "重启网关"),
+        ("hermes gateway status", "状态"),
+        ("/platforms", "平台连接"),
+        ("/restart", "重启 (会话内)"),
+        ("/sethome", "设为主频道"),
+        ("/approve", "审批命令"),
+        ("/deny", "拒绝命令"),
+        ("/cron", "定时任务"),
+        ("hermes cron list", "列出定时任务"),
+        ("hermes webhook list", "Webhook"),
+        ("/kanban", "协作看板"),
+        ("hermes update", "更新版本"),
+    ],
+}
+```
+
+#### 2.2 构建帮助卡片（`card_action.py`）
+
+```python
 def build_help_card(*, tab: str) -> dict:
-    """构建交互帮助卡片。"""
-    label = _HELP_TABS_CN[tab]
-    commands = _HELP_COMMANDS[tab]
+    """Build an interactive help card showing commands for *tab*.
     
-    elements = [
-        # Tab 切换按钮行
-        {"tag": "action", "actions": [
-            {"tag": "button", "text": lbl, "type": "primary" if k == tab else "default",
-             "value": {"help_action": "help_tab", "tab": k}}
-            for k, lbl in _HELP_TABS_CN.items()
-        ]},
-        {"tag": "hr"},
-        # 命令列表（每行：文本 + ▶ 按钮）
-        *[_build_command_row(name, desc) for name, desc in commands],
-        {"tag": "hr"},
-        {"tag": "note", "text": {"tag": "plain_text", "content": "💡 点击 ▶ 执行命令，点击 Tab 切换"}},
+    卡片结构：
+      header (蓝色, "🤖 Hermes Agent 帮助 — {Tab名}")
+      ├── action (4 个 Tab 按钮, current=primary, others=default)
+      ├── hr
+      ├── column_set × N (每条命令: 左=markdown text, 右=▶ button)
+      ├── hr
+      └── note ("点击 ▶ 执行命令…")
+    """
+    tab_labels = _HELP_TABS_CN
+    all_commands = _HELP_COMMANDS
+    label = tab_labels.get(tab, tab_labels["chat"])
+    commands = all_commands.get(tab, all_commands["chat"])
+
+    # Tab buttons row
+    tab_actions = [
+        {
+            "tag": "button",
+            "text": {"tag": "plain_text", "content": lbl},
+            "type": "primary" if key == tab else "default",
+            "value": {"help_action": "help_tab", "tab": key},
+        }
+        for key, lbl in tab_labels.items()
     ]
-    
+
+    # Per-command rows: text column + ▶ button column
+    command_elements = []
+    for cmd_name, cmd_desc in commands:
+        command_elements.append({
+            "tag": "column_set",
+            "flex_mode": "none",
+            "background_style": "default",
+            "columns": [
+                {
+                    "tag": "column",
+                    "width": "weighted",
+                    "weight": 1,
+                    "elements": [
+                        {"tag": "markdown", "content": f"**`{cmd_name}`**  {cmd_desc}"},
+                    ],
+                },
+                {
+                    "tag": "column",
+                    "width": "auto",
+                    "elements": [
+                        {
+                            "tag": "button",
+                            "text": {"tag": "plain_text", "content": "▶"},
+                            "type": "default",
+                            "value": {"help_action": "help_cmd", "cmd": cmd_name.split()[0]},
+                        },
+                    ],
+                },
+            ],
+        })
+
+    elements = [
+        {"tag": "action", "actions": tab_actions},
+        {"tag": "hr"},
+        *command_elements,
+        {"tag": "hr"},
+        {"tag": "note", "text": {"tag": "plain_text", "content": "💡 提示: 命令支持前缀匹配，如 /pro l = /provider list。点击 ▶ 执行命令，点击 Tab 切换板块。"}},
+    ]
+
     return {
         "config": {"wide_screen_mode": True},
-        "header": {"title": {"tag": "plain_text", "content": f"🤖 Hermes Agent 帮助 — {label}"}, "template": "blue"},
+        "header": {
+            "title": {"tag": "plain_text", "content": f"🤖 Hermes Agent 帮助 — {label}"},
+            "template": "blue",
+        },
         "elements": elements,
+    }
+
+
+def build_help_loading_response(*, cmd: str) -> dict:
+    """Show a brief 'executing' card while the command runs."""
+    return {
+        "config": {"wide_screen_mode": True},
+        "header": {
+            "title": {"tag": "plain_text", "content": f"⚡ 执行: {cmd}"},
+            "template": "blue",
+        },
+        "elements": [
+            {"tag": "markdown", "content": f"正在执行 **`{cmd}`** … 结果将出现在对话中。"},
+        ],
     }
 ```
 
----
+#### 2.3 server.py 加路由
 
-### Phase 3 — 帮助卡片与网关对接
+```python
+# 在 create_app() 中添加
+app.router.add_post("/card_action", handle_card_action)
+```
 
-#### 3.1 feishu.py 追加最小 hook
+#### 2.4 card_action HTTP handler（`card_action.py`）
 
-在 `_on_card_action_trigger` 中，在 `update_prompt_action` 之后、`_handle_card_action_event` 之前加：
+```python
+async def handle_card_action(request: web.Request) -> web.Response:
+    """处理帮助卡片的按钮点击。
+    
+    两种 action:
+      help_tab  → 构建新卡片 JSON 返回 → sidecar 返回给 feishu.py
+      help_cmd  → 触发命令注入 → 返回"执行中"卡片
+    """
+    payload = await request.json()
+    action_value = payload.get("value", {})
+    help_action = action_value.get("help_action")
+
+    if help_action == "help_tab":
+        tab_name = action_value.get("tab", "chat")
+        card = build_help_card(tab=tab_name)
+        return web.json_response({
+            "action": "replace",
+            "card": card,
+        })
+
+    elif help_action == "help_cmd":
+        cmd = str(action_value.get("cmd", "") or "")
+        if cmd:
+            # 异步触发命令注入（不阻塞卡片响应）
+            asyncio.ensure_future(inject_command_to_gateway(request, cmd))
+        loading_card = build_help_loading_response(cmd=cmd)
+        return web.json_response({
+            "action": "replace",
+            "card": loading_card,
+        })
+
+    return web.json_response({"action": "none"})
+```
+
+#### 2.5 命令注入（`card_action.py`）
+
+```python
+async def inject_command_to_gateway(request: web.Request, command: str) -> None:
+    """将帮助卡片上的命令注入到 Hermes Gateway agent 会话中。
+    
+    通过 gateway 内部 API 或 lark-cli 将命令作为用户消息发送。
+    """
+    # 方案 A: 如果 sidecar 知道 chat_id，直接发消息
+    chat_id = request.app.get("_card_action_chat_id")
+    if chat_id:
+        feishu_client = request.app.get(FEISHU_CLIENT_KEY)
+        if feishu_client:
+            # 发送命令文本到群聊，等价于用户输入
+            await feishu_client.send_card(chat_id, {
+                "config": {"wide_screen_mode": True},
+                "header": {"title": {"tag": "plain_text", "content": "⚡ 执行命令"}, "template": "blue"},
+                "elements": [
+                    {"tag": "markdown", "content": f"执行: **`{command}`**"},
+                ],
+            })
+    
+    # 方案 B: 调用 gateway 的 inject API（如果 Hermes 暴露了）
+    # POST http://localhost:9090/inject-message
+    # 需要 Hermes gateway 插件支持
+```
+
+#### 2.6 feishu.py 的 hook（最小改动）
+
+在 `_on_card_action_trigger` 中，在 `update_prompt_action` 之后、`_handle_card_action_event` 之前插入：
 
 ```python
 help_action = action_value.get("help_action") if isinstance(action_value, dict) else None
 if help_action:
-    # 转发到 sidecar /card_action
-    card_response = await self._forward_to_sidecar(action_value)
-    if card_response and P2CardActionTriggerResponse is not None:
+    return self._handle_help_card_action(
+        event=event,
+        action_value=action_value,
+        loop=loop,
+    )
+```
+
+#### 2.7 feishu.py `_handle_help_card_action`（同步 handler）
+
+```python
+def _handle_help_card_action(self, *, event: Any, action_value: Dict[str, Any], loop: Any) -> Any:
+    """Handle help card tab switch and command execution button clicks."""
+    help_action = action_value.get("help_action")
+    
+    if help_action == "help_tab":
+        tab_name = action_value.get("tab", "chat")
+        if P2CardActionTriggerResponse is None:
+            return None
         response = P2CardActionTriggerResponse()
         if CallBackCard is not None:
             card = CallBackCard()
             card.type = "raw"
-            card.data = card_response.get("card", build_help_card(tab="chat"))
+            card.data = self._build_help_card(tab=tab_name)
             response.card = card
         return response
+
+    elif help_action == "help_cmd":
+        cmd = str(action_value.get("cmd", "") or "")
+        if cmd:
+            self._submit_on_loop(loop, self._execute_help_command(command=cmd, event=event))
+        if P2CardActionTriggerResponse is None:
+            return None
+        response = P2CardActionTriggerResponse()
+        if CallBackCard is not None:
+            card = CallBackCard()
+            card.type = "raw"
+            card.data = self._build_help_loading_response(cmd=cmd)
+            response.card = card
+        return response
+
+    if P2CardActionTriggerResponse is None:
+        return None
+    return P2CardActionTriggerResponse()
 ```
 
-需要新增 `_forward_to_sidecar` 异步方法：
+#### 2.8 feishu.py `_execute_help_command`（async 路由）
 
 ```python
-async def _forward_to_sidecar(self, action_value: dict) -> dict | None:
-    """转发卡片动作到 sidecar /card_action。失败时静默降级。"""
-    sidecar_url = os.getenv("HERMES_FEISHU_CARD_EVENT_URL", "http://127.0.0.1:8765")
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                f"{sidecar_url}/card_action",
-                json={"value": action_value},
-                timeout=aiohttp.ClientTimeout(total=2),
-            ) as resp:
-                return await resp.json()
-    except Exception:
-        logger.warning("[Feishu] Sidecar /card_action unreachable, skipping")
-        return None
+async def _execute_help_command(self, *, command: str, event: Any) -> None:
+    """Route a help card command button click as a synthetic user message.
+    
+    关键机制：将命令文本包装成 MessageEvent(TEXT) 注入 agent pipeline。
+    使用 TEXT 类型而非 COMMAND 类型，因为 pipeline 会自动检测 / 前缀
+    并转为 COMMAND 处理。
+    """
+    context = getattr(event, "context", None)
+    chat_id = str(getattr(context, "open_chat_id", "") or "")
+    operator = getattr(event, "operator", None)
+    open_id = str(getattr(operator, "open_id", "") or "")
+    if not chat_id or not open_id:
+        logger.debug("[Feishu] Help cmd missing chat_id or operator open_id, dropping")
+        return
+
+    # 构造发送者 profile
+    sender_id = SimpleNamespace(open_id=open_id, user_id=None, union_id=None)
+    sender_profile = await self._resolve_sender_profile(sender_id)
+    chat_info = await self.get_chat_info(chat_id)
+    source = self.build_source(
+        chat_id=chat_id,
+        chat_name=chat_info.get("name") or chat_id or "Feishu Chat",
+        chat_type=self._resolve_source_chat_type(chat_info=chat_info, event_chat_type="group"),
+        user_id=sender_profile["user_id"],
+        user_name=sender_profile["user_name"],
+        thread_id=None,
+        user_id_alt=sender_profile["user_id_alt"],
+    )
+    
+    # Use TEXT type so the message pipeline properly detects /prefix → COMMAND
+    synthetic_event = MessageEvent(
+        text=command,
+        message_type=MessageType.TEXT,
+        source=source,
+        message_id=str(uuid.uuid4()),
+        timestamp=datetime.now(),
+    )
+    logger.info("[Feishu] Routing help cmd %r from %s in %s", command, open_id, chat_id)
+    await self._handle_message_with_guards(synthetic_event)
 ```
+
+### Phase 3 — 帮助卡片与网关对接
 
 ---
 
