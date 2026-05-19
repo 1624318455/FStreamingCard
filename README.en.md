@@ -1,263 +1,37 @@
-# Hermes Feishu Streaming Card Plugin V3.4.1
+# FStreamingCard
 
-[中文](README.md) | [English](README.en.md)
+> Fork of [baileyh8/hermes-feishu-streaming-card](https://github.com/baileyh8/hermes-feishu-streaming-card) v3.4.1, integrating [Cheerwhy/hermes-lark-streaming](https://github.com/Cheerwhy/hermes-lark-streaming) CardKit v2.0 streaming rendering.
 
-![Hermes Feishu Streaming Card cover](docs/assets/readme-cover.png)
+Feishu/Lark Streaming Card Sidecar for Hermes Agent Gateway, featuring CardKit v2.0 element-level incremental updates, interactive help card, multi-profile / multi-bot support.
 
-Streaming card messages for the Feishu/Lark platform in Hermes Agent Gateway. V3.4.1 **sidecar-only** architecture with Hermes 0.13.0+ compatibility, multi-profile in-process isolation, multi-bot routing, DeepSeek chain-of-thought compatibility, table limit protection, and a Hermes v2026.5.7 fallback message id lifecycle fix.
+---
 
-![Real Feishu streaming card screenshot](docs/assets/feishu-weather-card.png)
+## Core Capabilities
 
-## V3.4.1 Highlights
+| Capability | Status | Description |
+|-----------|--------|-------------|
+| CardKit v2.0 element-level update | ✅ v0.2.0 | 100ms interval, delta-only, true typewriter effect |
+| IM PATCH fallback | ✅ v0.2.0 | Automatic fallback to full card replacement |
+| Interactive help card | ✅ v0.2.0 | 4 Tab switch + ▶ command inject |
+| Multi-profile isolation | ✅ upstream v3.3+ | Single sidecar serving multiple Hermes instances |
+| Multi-bot routing | ✅ upstream v3.2+ | Per-chat bot routing |
+| Streaming thinking display | ✅ upstream | Incremental thinking/answer rendering |
+| Tool call tracking | ✅ upstream | Cumulative call count and status |
+| Footer statistics | ✅ upstream | Duration/model/tokens/context |
+| Table overflow protection | ✅ upstream | Auto-truncate beyond 5 tables |
+| Cron final cards | ✅ upstream | Scheduled task terminal cards |
 
-- **issue #25 fixed**: Hermes v2026.5.7 started hooks now treat `event_message_id` as the explicit `message_id`, preventing `message.started` and `message.completed` fallback card ids from diverging.
-- **Hermes 0.13.0+ and later**: the installer selects the `gateway_run_013_plus` hook strategy from the Hermes version and code anchors.
-- **older Hermes remains supported**: Hermes `v2026.4.23` through `0.12.x` continues to use the `legacy_gateway_run` strategy; no plugin downgrade is required.
-- **doctor reports compatibility**: `doctor` prints `hook_strategy`, `compatibility`, and anchor detection results so you can confirm the selected path.
-- **Reinstall the hook after upgrading**: run `install --hermes-dir ... --yes` after upgrading so Hermes uses the matching hook implementation.
-- **issue #23 fixed**: multi Hermes profile + multi Feishu bot deployments explicitly identify profile ids and route to the matching bot.
-- **Multi-profile / multi-bot polish**: per-bot/profile title, cron final cards, attachment summaries + native media delivery, and reply card context.
+Full changelog: [CHANGELOG.md](CHANGELOG.md).
 
 ## Quick Install
 
 ```bash
-git clone https://github.com/baileyh8/hermes-feishu-streaming-card.git
-cd hermes-feishu-streaming-card && pip install -e ".[test]"
+git clone https://github.com/1624318455/FStreamingCard.git
+cd FStreamingCard && pip install -e ".[test]"
 export FEISHU_APP_ID=cli_xxx FEISHU_APP_SECRET=xxx
 python3 -m hermes_feishu_card.cli setup --hermes-dir ~/.hermes/hermes-agent --yes
 ```
 
-`setup` generates config, validates Hermes (older Hermes from `v2026.4.23` through `0.12.x`, plus Hermes `0.13.0+` anchors), installs the hook, starts the sidecar, and checks health — all in one pass. See the CLI table below for step-by-step commands.
-
-## Core Features
-
-- **Multi-profile in-process** (new in V3.3.0): one sidecar serves multiple Hermes profiles with `profile_id:message_id` composite keys for session isolation and per-profile credentials/bot routing
-- **Multi-bot routing & group chat**: register bots in `bots.items`, map `bindings.chats` to `chat_id`, fallback/default bot for unmatched sessions
-- **Profile / bot card titles**: global, profile, and bot card titles are supported, with bot-level titles taking precedence
-- **Streaming thinking**: renders `thinking.delta`, filters `<think>`/`</think>` and DeepSeek `<thinking>`/`</thinking>` tags
-- **Progressive answer**: streams `answer.delta` into one card, replaces thinking on completion
-- **Cron final cards and reply context**: cron jobs can deliver final cards, and reply cards preserve the needed context
-- **Attachment summaries and native media delivery**: attachment summaries appear in cards while media is delivered through native Feishu message capabilities
-- **Tool call tracking**: `tool.updated` shows cumulative call count and status
-- **Runtime footer**: duration, model, tokens, context %. Non-terminal cards show a rotating braille spinner
-- **Table limit protection** (new in V3.3.0): auto-truncates tables exceeding Feishu's 5-table limit with a notice appended
-- **Platform check fix** (new in V3.3.0): non-Feishu platforms no longer swallowed by the complete hook
-- **Fault isolation**: sidecar unavailable → Hermes hook fail-open, native text continues working
-- **Safe installer**: fail-closed, checks version and code structure before writing. `restore`/`uninstall` refuse on modified files
-
-## Upgrading
-
-Upgrading from V3.2.x/V3.3.0/V3.4.0 to V3.4.1 is backward-compatible. **Single-profile configs need no changes.** For Hermes 0.13.0+, you must run `install --hermes-dir ... --yes` again so the installer writes the `gateway_run_013_plus` hook strategy; older Hermes continues to use `legacy_gateway_run`.
-
-```bash
-# 1. Stop sidecar
-python3 -m hermes_feishu_card.cli stop --config ~/.hermes_feishu_card/config.yaml
-
-# 2. Update code
-cd /path/to/hermes-feishu-streaming-card
-git checkout v3.4.1 && pip install -e ".[test]" --upgrade
-
-# 3. Diagnose Hermes hook strategy and anchors
-python3 -m hermes_feishu_card.cli doctor --config ~/.hermes_feishu_card/config.yaml --hermes-dir ~/.hermes/hermes-agent
-
-# 4. Reinstall hook (V3.4.1 selects hook_strategy by Hermes version)
-python3 -m hermes_feishu_card.cli install --hermes-dir ~/.hermes/hermes-agent --yes
-
-# 5. Start sidecar
-python3 -m hermes_feishu_card.cli start --config ~/.hermes_feishu_card/config.yaml
-```
-
-**Using multi-profile**: add a `profiles` section to `config.yaml` (see multi-profile config example below) with per-profile `feishu.app_id`/`app_secret`. Environment variables `FEISHU_APP_ID`/`FEISHU_APP_SECRET` are ignored in multi-profile mode.
-
-**Rolling back to V3.2**: stop sidecar, `git checkout v3.2.1`, reinstall `pip`, restore backed-up `config.yaml`, re-run `install` + `start`.
-
-## Configuration
-
-Copy `config.yaml.example` locally. Never commit real credentials. Three common setups:
-
-**Single Profile (minimal)** — quickest way to start:
-
-```yaml
-server:
-  host: 127.0.0.1
-  port: 8765
-feishu:
-  app_id: ""
-  app_secret: ""
-card:
-  title: Hermes Agent
-  footer_fields: [duration, model, input_tokens, output_tokens, context]
-```
-
-**Single Profile + Multi-bot** — register bots, route by chat_id:
-
-```yaml
-server:
-  host: 127.0.0.1
-  port: 8765
-feishu:
-  app_id: ""
-  app_secret: ""          # fallback only
-bots:
-  default: default
-  items:
-    sales:
-      app_id: "cli_sales_xxx"
-      app_secret: "xxx"
-    support:
-      app_id: "cli_support_yyy"
-      app_secret: "yyy"
-bindings:
-  fallback_bot: default
-  chats:
-    oc_5cc6a25d8815790fa890dd0226005e83: sales
-  group_rules:
-    enabled: false
-card:
-  title: Hermes Agent
-  footer_fields: [duration, model, input_tokens, output_tokens, context]
-```
-
-**Multi-profile** (new in V3.3.0) — one sidecar, multiple Hermes instances, isolated per profile:
-
-```yaml
-server:
-  host: 127.0.0.1
-  port: 8765
-profiles:
-  engineering:
-    feishu:
-      app_id: "cli_eng_xxx"
-      app_secret: "xxx"
-    bots:
-      default: default
-      items:
-        default:
-          app_id: "cli_eng_xxx"
-          app_secret: "xxx"
-    bindings:
-      fallback_bot: default
-      chats: {}
-  sales:
-    feishu:
-      app_id: "cli_sales_xxx"
-      app_secret: "xxx"
-    bots:
-      default: default
-      items:
-        default:
-          app_id: "cli_sales_xxx"
-          app_secret: "xxx"
-    bindings:
-      fallback_bot: default
-      chats: {}
-  group_rules:
-    enabled: false
-card:
-  title: Hermes Agent
-  footer_fields: [duration, model, input_tokens, output_tokens, context]
-```
-
-In multi-profile mode, `FEISHU_APP_ID`/`FEISHU_APP_SECRET` env vars are ignored. `footer_fields` accepts: `duration`, `model`, `input_tokens`, `output_tokens`, `context`.
-
-## Feishu App Setup
-
-```bash
-export FEISHU_APP_ID=cli_xxx FEISHU_APP_SECRET=xxx
-# Real Feishu smoke test:
-python3 -m hermes_feishu_card.cli smoke-feishu-card --config config.yaml.example --chat-id oc_xxx
-```
-
-## Hermes Gateway Streaming And Thinking
-
-Ensure Hermes `config.yaml` has `streaming.enabled: true` and `streaming.transport: edit`. Avoid `display.platforms.feishu.streaming: false`. Do not treat `display.show_reasoning` as required — it may prepend a reasoning code block to the final text, interfering with the card streaming experience. If the model only returns final answers (no thinking deltas), the card shows the final answer directly.
-
-## CLI Commands
-
-| Command | Description |
-|---------|-------------|
-| `setup --hermes-dir ... --yes` | One-shot install (config, check, hook, sidecar, health) |
-| `doctor --config ... --hermes-dir ...` | Diagnostics: `version_source`, `version`, `minimum_supported_version`, `run_py_exists`, `hook_strategy`, `compatibility`, anchors, `reason` |
-| `install --hermes-dir ... --yes` | Install hook into Hermes |
-| `restore --hermes-dir ... --yes` | Restore original Hermes files |
-| `uninstall --hermes-dir ... --yes` | Uninstall and restore |
-| `start --config ...` | Start sidecar |
-| `stop --config ...` | Stop sidecar (validates PID/token against `/health` `process_pid/process_token`) |
-| `status --config ...` | Sidecar status and metrics |
-| `bots list|show|add|remove --config ...` | Manage bot registry |
-| `bots bind-chat|unbind-chat --config ...` | Manage chat bindings |
-
-## Architecture
-
-```text
-Hermes Gateway
-  └─ minimal hook in gateway/run.py
-       └─ hermes_feishu_card.hook_runtime
-            └─ HTTP POST /events ——→  sidecar server
-                                      ├─ CardSession state machine
-                                      ├─ render_card() card rendering
-                                      ├─ FeishuClient tenant token / send / update
-                                      ├─ throttling, retry, locks, diagnostics
-                                      └─ /health metrics
-```
-
-The Hermes hook converts `message.started` / `thinking.delta` / `answer.delta` / `tool.updated` / `message.completed` / `message.failed` into `SidecarEvent` and forwards to the sidecar. The sidecar owns full session state and the Feishu CardKit boundary — independently testable, restartable, and diagnosable. Historical code is archived under `legacy/` (`installer_v2.py`, `gateway_run_patch.py`, `patch_feishu.py`, etc.) — not the active runtime. Current development uses `hermes_feishu_card/`. See [docs/migration.en.md](docs/migration.en.md).
-
-## FAQ
-
-- **No thinking / not streaming**: check Hermes `streaming.enabled: true` + `streaming.transport: edit`, confirm model exposes reasoning deltas. Don't blindly enable `show_reasoning`.
-- **No real Feishu cards**: without credentials, the sidecar uses a no-op client. In multi-profile mode, check each profile's `feishu` config.
-- **Duplicate cards**: inspect `/health` metrics (`events_received`, `feishu_send_successes`). V3.3.0 per-message lock + `profile_id:message_id` keys ensure one card per message.
-- **Gray native text**: after sidecar accepts `message.completed`, Hermes hook suppresses native text; fail-open on sidecar unavailable. V3.3.0 fixes non-Feishu platforms being swallowed.
-- **`doctor` unsupported**: Hermes ≥ `v2026.4.23` (reads `VERSION` or Git tag `v2026.4.23+`), `gateway/run.py` must exist.
-- **No cards after upgrading Hermes 0.13.0+**: run `doctor --config ... --hermes-dir ...` to inspect `hook_strategy`, `compatibility`, and anchors, then re-run `install --hermes-dir ... --yes`.
-- **Restore fails**: file modified → `restore`/`uninstall` refuse to overwrite. Back up, then manually diff.
-- **Footer tokens wrong**: abnormal values filtered; if still wrong, inspect Hermes `tokens`/`context` metadata.
-- **Table limit exceeded**: V3.3.0 auto-truncates >5 tables with a notice. Reduce Markdown tables.
-
-## Version History
-
-| Version | Date | Highlights |
-|---------|------|-----------|
-| [v3.4.1](https://github.com/baileyh8/hermes-feishu-streaming-card/releases/tag/v3.4.1) | 2026-05 | Fixes issue #25, keeping Hermes v2026.5.7 fallback message ids lifecycle-stable |
-| [v3.4.0](https://github.com/baileyh8/hermes-feishu-streaming-card/releases/tag/v3.4.0) | 2026-05 | Hermes 0.13.0+ compatibility, older Hermes strategy preserved, issue #23, multi-profile/multi-bot, attachments and reply context |
-| [v3.3.0](https://github.com/baileyh8/hermes-feishu-streaming-card/releases/tag/v3.3.0) | 2026-05 | Multi-profile, DeepSeek compat, table protection, footer spinner, platform fix |
-| [v3.2.1](https://github.com/baileyh8/hermes-feishu-streaming-card/releases/tag/v3.2.1) | 2026-04 | Accept-Encoding fix |
-| [v3.2.0](https://github.com/baileyh8/hermes-feishu-streaming-card/releases/tag/v3.2.0) | 2026-04 | Multi-bot routing, group chat bindings, Bot CLI, routing diagnostics |
-| [v3.1.0](https://github.com/baileyh8/hermes-feishu-streaming-card/releases/tag/v3.1.0) | 2026-04 | Sidecar architecture, streaming cards, health endpoint, install wizard |
-| [v3.0.0](https://github.com/baileyh8/hermes-feishu-streaming-card/releases/tag/v3.0.0) | 2026-04 | Initial sidecar-only release (migrated from V2.x monolith hook) |
-
-Full changelog: [CHANGELOG.md](CHANGELOG.md).
-
-## Testing
-
-```bash
-python3 -m pytest -q    # run the full automated regression suite
-```
-
-Coverage: real Hermes Gateway E2E, real Feishu app card verification, 16k long-card stress test, `doctor → install → restore` loop, multi-profile routing, DeepSeek tag filtering.
-
-## Documentation
-
-- Architecture: [中文](docs/architecture.md) / [English](docs/architecture.en.md)
-- Event protocol: [中文](docs/event-protocol.md) / [English](docs/event-protocol.en.md)
-- Installer safety: [中文](docs/installer-safety.md) / [English](docs/installer-safety.en.md)
-- Migration: [中文](docs/migration.md) / [English](docs/migration.en.md)
-- E2E verification: [中文](docs/e2e-verification.md) / [English](docs/e2e-verification.en.md)
-- Release readiness: [中文](docs/release-readiness.md) / [English](docs/release-readiness.en.md)
-- Testing: [中文](docs/testing.md) / [English](docs/testing.en.md)
-
 ## License
 
-MIT License. See [LICENSE](LICENSE).
-
-## Contributors
-
-Thanks to these contributors for improving the project:
-
-- [gischuck](https://github.com/gischuck) — [PR #12](https://github.com/baileyh8/hermes-feishu-streaming-card/pull/12) Accept-Encoding fix (V3.2.1 brotli compatibility)
-- [fengs2021](https://github.com/fengs2021) — [PR #17](https://github.com/baileyh8/hermes-feishu-streaming-card/pull/17) lock optimization and update interval improvement (V3.3.0)
-
-## Security
-
-Do not commit App Secret, tenant token, or real chat_id. Screenshots demonstrate card rendering only. Production credentials belong in local config or environment variables.
+MIT License
