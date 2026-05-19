@@ -9,14 +9,14 @@ from aiohttp import web
 logger = logging.getLogger(__name__)
 
 _HELP_TABS_CN: Dict[str, str] = {
-    "chat": "💬 对话命令",
-    "cli": "⚙️ CLI 配置",
-    "ext": "🧩 技能与扩展",
-    "infra": "🌐 平台与自动化",
+    "session": "📄 会话管理",
+    "config": "⚙️ 命令与配置",
+    "tools": "🔧 工具与自动化",
+    "system": "💡 系统",
 }
 
 _HELP_COMMANDS: Dict[str, list[tuple[str, str]]] = {
-    "chat": [
+    "session": [
         ("/new [名称]", "创建新会话"),
         ("/list", "列出所有会话"),
         ("/switch <序号>", "切换会话"),
@@ -34,71 +34,66 @@ _HELP_COMMANDS: Dict[str, list[tuple[str, str]]] = {
         ("/compress", "手动压缩上下文"),
         ("/rollback [N]", "恢复检查点"),
         ("/background <prompt>", "后台执行"),
-        ("/help", "显示命令"),
-        ("/usage", "Token 用量"),
-        ("/status", "会话信息"),
-        ("/profile", "当前 Profile"),
-        ("/debug", "上传调试报告"),
     ],
-    "cli": [
-        ("hermes config", "查看配置"),
-        ("hermes config set KEY VAL", "设置配置"),
-        ("hermes config path", "配置路径"),
-        ("hermes model", "选择模型/提供商"),
-        ("hermes setup [section]", "设置向导"),
-        ("hermes doctor [--fix]", "检查依赖"),
-        ("hermes login [--provider P]", "OAuth 登录"),
+    "config": [
+        ("/help", "显示帮助命令"),
+        ("/summarize", "对话摘要"),
+        ("/settings", "查看设置"),
+        ("/config", "显示配置"),
         ("/model [名称]", "切换模型"),
+        ("/provider [名称]", "切换提供商"),
         ("/reasoning [级别]", "推理深度"),
         ("/voice [on|off|tts]", "语音模式"),
         ("/yolo", "跳过审批"),
         ("/personality [名称]", "人格设置"),
         ("/verbose", "详细输出"),
-        ("/config", "显示配置"),
-        ("hermes profile list", "Profile 管理"),
-        ("hermes sessions list", "会话管理"),
+        ("hermes config", "查看配置"),
+        ("hermes config set KEY VAL", "设置配置"),
+        ("hermes setup [section]", "设置向导"),
+        ("hermes doctor [--fix]", "检查依赖"),
+        ("hermes login [--provider P]", "OAuth 登录"),
     ],
-    "ext": [
+    "tools": [
+        ("/tools", "工具管理"),
+        ("/toolsets", "列出工具集"),
         ("/skill <名称>", "加载 Skill"),
         ("hermes skills list", "列出 Skills"),
         ("hermes skills install ID", "安装 Skill"),
         ("hermes skills search QUERY", "搜索 Skill"),
-        ("/tools", "工具管理"),
-        ("hermes tools", "交互式工具开关"),
-        ("/toolsets", "列出工具集"),
         ("/reload-skills", "重扫 Skills"),
         ("/reload-mcp", "重载 MCP"),
-        ("/plugins", "插件列表"),
-        ("/curator", "Skill 维护"),
         ("hermes mcp list", "MCP 管理"),
+        ("/plugins", "插件列表"),
         ("hermes plugins list", "插件管理"),
-    ],
-    "infra": [
-        ("hermes gateway run", "启动网关"),
-        ("hermes gateway start", "启动服务"),
-        ("hermes gateway stop", "停止服务"),
-        ("hermes gateway restart", "重启网关"),
-        ("hermes gateway status", "状态"),
-        ("/platforms", "平台连接"),
-        ("/restart", "重启 (会话内)"),
-        ("/sethome", "设为主频道"),
-        ("/approve", "审批命令"),
-        ("/deny", "拒绝命令"),
+        ("/curator", "Skill 维护"),
         ("/cron", "定时任务"),
         ("hermes cron list", "列出定时任务"),
         ("hermes webhook list", "Webhook"),
+    ],
+    "system": [
+        ("/status", "会话信息"),
+        ("/usage", "Token 用量"),
+        ("/profile", "当前 Profile"),
+        ("/restart", "重启 (会话内)"),
+        ("/sethome", "设为主频道"),
+        ("/platforms", "平台连接"),
+        ("/approve", "审批命令"),
+        ("/deny", "拒绝命令"),
         ("/kanban", "协作看板"),
+        ("/debug", "上传调试报告"),
+        ("hermes gateway status", "网关状态"),
+        ("hermes gateway restart", "重启网关"),
         ("hermes update", "更新版本"),
     ],
 }
 
 
-def build_help_card(*, tab: str = "chat") -> dict[str, Any]:
+def build_help_card(*, tab: str = "session") -> dict[str, Any]:
     """构建交互帮助卡片。"""
     if tab not in _HELP_TABS_CN:
-        tab = "chat"
+        tab = "session"
     label = _HELP_TABS_CN[tab]
-    commands = _HELP_COMMANDS.get(tab, [])
+    commands = _HELP_COMMANDS.get(tab, _HELP_COMMANDS["session"])
 
     tab_actions = [
         {
@@ -186,7 +181,7 @@ async def handle_card_action(request: web.Request) -> web.Response:
     help_action = action_value.get("help_action")
 
     if help_action == "help_tab":
-        tab_name = action_value.get("tab", "chat")
+        tab_name = action_value.get("tab", "session")
         card = build_help_card(tab=tab_name)
         return web.json_response({"card": card, "action": "replace"})
 

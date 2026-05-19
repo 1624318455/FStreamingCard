@@ -10,7 +10,7 @@ from typing import Any, Dict
 from aiohttp import web
 
 from .bots import RouteResult
-from .card_action import handle_card_action
+from .card_action import build_help_card, handle_card_action
 from .events import EventValidationError, SidecarEvent
 from .feishu_client import CardKitNotSupported
 from .metrics import SidecarMetrics
@@ -79,6 +79,7 @@ def create_app(
     app.router.add_get("/messages/{message_id}/summary", _message_summary)
     app.router.add_post("/events", _events)
     app.router.add_post("/card_action", handle_card_action)
+    app.router.add_post("/help", _help)
     return app
 
 
@@ -146,6 +147,28 @@ async def _message_summary(request: web.Request) -> web.Response:
     if summary is None:
         return web.json_response({"ok": False, "error": "not found"}, status=404)
     return web.json_response({"ok": True, **summary})
+
+
+async def _help(request: web.Request) -> web.Response:
+    """处理 /help：构建交互卡片并发送到指定群聊。"""
+    try:
+        data = await request.json()
+    except Exception:
+        return web.json_response({"ok": False, "error": "invalid json"}, status=400)
+
+    chat_id = data.get("chat_id", "")
+    tab = data.get("tab", "session")
+
+    if not isinstance(chat_id, str) or not chat_id.strip():
+        return web.json_response({"ok": False, "error": "chat_id required"}, status=400)
+
+    card = build_help_card(tab=tab)
+    bot_id = _resolve_default_bot_id(request.app)
+    message_id = await _send_card(request, chat_id, card, bot_id)
+    if message_id is None:
+        return web.json_response({"ok": False, "error": "feishu send failed"}, status=502)
+
+    return web.json_response({"ok": True, "card_message_id": message_id})
 
 
 async def _events(request: web.Request) -> web.Response:
@@ -624,6 +647,27 @@ def _client_for_bot(app: web.Application, bot_id: str | None) -> Any:
 
 def _is_client_factory(feishu_client: Any) -> bool:
     return callable(getattr(feishu_client, "get_client", None))
+
+
+def _resolve_default_bot_id(app: web.Application) -> str | None:
+    """Resolve the default bot_id from the bot registry."""
+    feishu_client = app[FEISHU_CLIENT_KEY]
+    if isinstance(feishu_client, dict):
+        factory = feishu_client.get("default")
+        if factory is not None:
+            registry = getattr(factory, "registry", None)
+            if registry is not None:
+                default_bot = getattr(registry, "default_bot_id", "")
+                if default_bot:
+                    return f"default:{default_bot}"
+        return "default:default"
+    if _is_client_factory(feishu_client):
+        registry = getattr(feishu_client, "registry", None)
+        if registry is not None:
+            default_bot = getattr(registry, "default_bot_id", "")
+            if default_bot:
+                return default_bot
+    return None
 
 
 def _safe_update_error_message(bot_id: str | None, exc: Exception) -> str:

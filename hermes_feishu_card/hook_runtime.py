@@ -15,6 +15,7 @@ from urllib import parse
 from urllib import request
 
 DEFAULT_EVENT_URL = "http://127.0.0.1:8765/events"
+DEFAULT_HELP_URL = "http://127.0.0.1:8765/help"
 DEFAULT_TIMEOUT_SECONDS = 0.8
 TERMINAL_TIMEOUT_SECONDS = 10.0
 PROFILE_ID_PATTERN = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
@@ -39,6 +40,7 @@ class RuntimeConfig:
     enabled: bool
     event_url: str
     timeout_seconds: float
+    help_url: str
 
 
 _SEQUENCES: dict[str, int] = {}
@@ -62,10 +64,14 @@ def load_runtime_config() -> RuntimeConfig:
     if not event_url:
         event_url = DEFAULT_EVENT_URL
     timeout_seconds = _timeout_from_env(os.environ.get("HERMES_FEISHU_CARD_TIMEOUT_MS"))
+    help_url = os.environ.get("HERMES_FEISHU_CARD_HELP_URL", "").strip()
+    if not help_url:
+        help_url = _derive_help_url(event_url)
     return RuntimeConfig(
         enabled=enabled,
         event_url=event_url,
         timeout_seconds=timeout_seconds,
+        help_url=help_url,
     )
 
 
@@ -81,6 +87,25 @@ def _timeout_from_env(value: str | None) -> float:
     return timeout_ms / 1000.0
 
 
+def _derive_help_url(event_url: str) -> str:
+    parsed = parse.urlsplit(event_url)
+    path = parsed.path.rstrip("/")
+    if path.endswith("/events"):
+        path = path[: -len("/events")]
+    path = path + "/help"
+    return parse.urlunsplit((parsed.scheme, parsed.netloc, path, "", ""))
+
+
+def _is_help_command(local_vars: dict[str, Any]) -> bool:
+    text = _first_string(local_vars, ("text", "content", "command"))
+    if text is None:
+        message_obj = local_vars.get("message")
+        text = _first_attr_string(message_obj, ("text", "content"))
+    if text is None:
+        return False
+    return text.strip().lower().startswith("/help")
+
+
 def emit_from_hermes_locals(
     local_vars: dict[str, Any],
     event_name: str = "message.started",
@@ -89,6 +114,13 @@ def emit_from_hermes_locals(
         config = load_runtime_config()
         if not config.enabled:
             return False
+        # Intercept /help command: send interactive card directly
+        if event_name == "message.started" and _is_help_command(local_vars):
+            asyncio.get_running_loop()
+            asyncio.create_task(
+                _send_help_card(config, local_vars)
+            )
+            return True
         payload = build_event(event_name, local_vars)
         if payload is None:
             return False
@@ -109,6 +141,19 @@ def emit_from_hermes_locals_threadsafe(
         config = load_runtime_config()
         if not config.enabled:
             return False
+        # Intercept /help command
+        if event_name == "message.started" and _is_help_command(local_vars):
+            coroutine = _send_help_card(config, local_vars)
+            if "_hfc_loop" in local_vars:
+                try:
+                    asyncio.run_coroutine_threadsafe(coroutine, local_vars["_hfc_loop"])
+                except Exception:
+                    coroutine.close()
+                    raise
+            else:
+                asyncio.get_running_loop()
+                asyncio.create_task(coroutine)
+            return True
         payload = build_event(event_name, local_vars)
         if payload is None:
             return False
@@ -137,6 +182,10 @@ async def emit_from_hermes_locals_async(
         config = load_runtime_config()
         if not config.enabled:
             return False
+        # Intercept /help command
+        if event_name == "message.started" and _is_help_command(local_vars):
+            await _send_help_card(config, local_vars)
+            return True
         payload = build_event(event_name, local_vars)
         if payload is None:
             return False
@@ -208,6 +257,24 @@ async def _send_fail_open(
         await _post_json(url, payload, timeout)
     except Exception:
         return
+
+
+async def _send_help_card(config: RuntimeConfig, local_vars: dict[str, Any]) -> None:
+    """Call sidecar /help to send interactive help card to the chat."""
+    chat_id = _first_string(local_vars, ("chat_id", "open_chat_id", "receive_id"))
+    if not chat_id:
+        message_obj = local_vars.get("message")
+        chat_id = _first_attr_string(message_obj, ("chat_id", "open_chat_id", "receive_id"))
+    if not chat_id:
+        return
+    try:
+        await _post_json(
+            config.help_url,
+            {"chat_id": chat_id},
+            config.timeout_seconds,
+        )
+    except Exception:
+        pass
 
 
 async def _post_json(url: str, payload: dict[str, Any], timeout: float) -> None:
