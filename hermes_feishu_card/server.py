@@ -10,7 +10,9 @@ from typing import Any, Dict
 from aiohttp import web
 
 from .bots import RouteResult
+from .card_action import handle_card_action
 from .events import EventValidationError, SidecarEvent
+from .feishu_client import CardKitNotSupported
 from .metrics import SidecarMetrics
 from .render import render_card
 from .session import CardSession
@@ -31,6 +33,7 @@ MESSAGE_LOCKS_KEY = web.AppKey("message_locks", dict)
 FOOTER_FIELDS_KEY = web.AppKey("footer_fields", Any)
 CARD_TITLE_KEY = web.AppKey("card_title", str)
 BASE_CARD_CONFIG_KEY = web.AppKey("base_card_config", dict)
+LAST_CARD_KEY = web.AppKey("last_card", dict)
 UPDATE_MAX_ATTEMPTS = 3
 UPDATE_MIN_INTERVAL_SECONDS = 0.5
 TERMINAL_EVENTS = {"message.completed", "message.failed"}
@@ -58,6 +61,7 @@ def create_app(
     app[PROCESS_TOKEN_KEY] = process_token
     app[METRICS_KEY] = SidecarMetrics()
     app[LAST_UPDATE_AT_KEY] = {}
+    app[LAST_CARD_KEY] = {}
     app[MESSAGE_LOCKS_KEY] = {}
     app[DIAGNOSTICS_KEY] = {
         "last_update_error": "",
@@ -74,6 +78,7 @@ def create_app(
     app.router.add_get("/health", _health)
     app.router.add_get("/messages/{message_id}/summary", _message_summary)
     app.router.add_post("/events", _events)
+    app.router.add_post("/card_action", handle_card_action)
     return app
 
 
@@ -212,10 +217,11 @@ async def _apply_event_locked(request: web.Request, event: SidecarEvent) -> tupl
             request.app[SESSION_CARD_CONFIGS_KEY][_session_key(event)] = (
                 _resolve_session_card_config(request.app, route.bot_id, event)
             )
+            initial_card = _render_session_card(request, session)
             message_id = await _send_card(
                 request,
                 event.chat_id,
-                _render_session_card(request, session),
+                initial_card,
                 route.bot_id,
             )
             if message_id is None:
@@ -228,6 +234,7 @@ async def _apply_event_locked(request: web.Request, event: SidecarEvent) -> tupl
                 ), None
             feishu_message_ids[_session_key(event)] = message_id
             message_bot_ids[_session_key(event)] = route.bot_id
+            request.app[LAST_CARD_KEY][_session_key(event)] = initial_card
         if applied:
             metrics.events_applied += 1
         else:
@@ -256,10 +263,11 @@ async def _apply_event_locked(request: web.Request, event: SidecarEvent) -> tupl
                 request.app[SESSION_CARD_CONFIGS_KEY][_session_key(event)] = (
                     _resolve_session_card_config(request.app, route.bot_id, event)
                 )
+                cron_card = _render_session_card(request, session)
                 message_id = await _send_card(
                     request,
                     event.chat_id,
-                    _render_session_card(request, session),
+                    cron_card,
                     route.bot_id,
                 )
                 if message_id is None:
@@ -273,6 +281,7 @@ async def _apply_event_locked(request: web.Request, event: SidecarEvent) -> tupl
                     ), None
                 feishu_message_ids[_session_key(event)] = message_id
                 message_bot_ids[_session_key(event)] = route.bot_id
+                request.app[LAST_CARD_KEY][_session_key(event)] = cron_card
                 _store_card_summary(request.app, event, session, message_id)
                 request.app[DIAGNOSTICS_KEY]["last_terminal_event"] = {
                     "message_id": event.message_id,
@@ -325,9 +334,15 @@ async def _apply_event_locked(request: web.Request, event: SidecarEvent) -> tupl
                     delay = _update_delay_seconds(last_update_at, event)
                     if delay > 0:
                         await asyncio.sleep(delay)
-                updated = await _update_card_for_app(request.app, feishu_message_id, card, bot_id)
+                updated = await _update_card_for_app(
+                    request.app, feishu_message_id, card, bot_id,
+                    session_key=_session_key(event),
+                )
                 if not updated and is_terminal:
-                    await _retry_terminal_update(request.app, feishu_message_id, card, bot_id)
+                    await _retry_terminal_update(
+                        request.app, feishu_message_id, card, bot_id,
+                        session_key=_session_key(event),
+                    )
 
             post_lock_task = _do_update()
     if applied:
@@ -465,9 +480,29 @@ async def _update_card(
 
 
 async def _update_card_for_app(
-    app: web.Application, message_id: str, card: dict[str, Any], bot_id: str | None
+    app: web.Application, message_id: str, card: dict[str, Any], bot_id: str | None,
+    session_key: str | None = None,
 ) -> bool:
     metrics: SidecarMetrics = app[METRICS_KEY]
+    # Try element-level CardKit update first
+    if session_key:
+        last_card = app[LAST_CARD_KEY].get(session_key)
+        if last_card is not None:
+            deltas = _compute_element_deltas(last_card, card)
+            if deltas:
+                try:
+                    client = _client_for_bot(app, bot_id)
+                    for element_id, content in deltas.items():
+                        await client.update_card_element(message_id, element_id, content)
+                    app[LAST_CARD_KEY][session_key] = card
+                    metrics.feishu_update_successes += 1
+                    return True
+                except CardKitNotSupported:
+                    logger.info("CardKit element update not supported, falling back to full card PATCH")
+                except Exception as exc:
+                    message = _safe_update_error_message(bot_id, exc)
+                    logger.warning("CardKit element update failed: %s, falling back to full card PATCH", message)
+    # Fallback: full card PATCH
     for attempt in range(UPDATE_MAX_ATTEMPTS):
         if attempt > 0:
             metrics.feishu_update_retries += 1
@@ -481,16 +516,19 @@ async def _update_card_for_app(
             metrics.feishu_update_failures += 1
             continue
         metrics.feishu_update_successes += 1
+        if session_key:
+            app[LAST_CARD_KEY][session_key] = card
         return True
     return False
 
 
 async def _retry_terminal_update(
-    app: web.Application, message_id: str, card: dict[str, Any], bot_id: str | None
+    app: web.Application, message_id: str, card: dict[str, Any], bot_id: str | None,
+    session_key: str | None = None,
 ) -> None:
     for delay in (1.0, 2.0, 4.0):
         await asyncio.sleep(delay)
-        if await _update_card_for_app(app, message_id, card, bot_id):
+        if await _update_card_for_app(app, message_id, card, bot_id, session_key=session_key):
             return
 
 
@@ -652,6 +690,37 @@ def _should_update_card(last_update_at: Dict[str, float], event: SidecarEvent) -
     if previous is None:
         return True
     return time.monotonic() - previous >= UPDATE_MIN_INTERVAL_SECONDS
+
+
+def _compute_element_deltas(old_card: dict[str, Any], new_card: dict[str, Any]) -> dict[str, str]:
+    """Compute changed elements between old and new CardKit v2.0 cards.
+
+    Returns a dict of element_id → new_content for elements that changed.
+    Returns empty dict if no changes or if card structure is incompatible.
+    """
+    old_body = old_card.get("body")
+    new_body = new_card.get("body")
+    if not isinstance(old_body, dict) or not isinstance(new_body, dict):
+        return {}
+    old_elements = old_body.get("elements", [])
+    new_elements = new_body.get("elements", [])
+    if not isinstance(old_elements, list) or not isinstance(new_elements, list):
+        return {}
+    old_map: dict[str, str] = {}
+    for el in old_elements:
+        if isinstance(el, dict) and el.get("element_id") and isinstance(el.get("content"), str):
+            old_map[el["element_id"]] = el["content"]
+    deltas: dict[str, str] = {}
+    for el in new_elements:
+        if not isinstance(el, dict):
+            continue
+        eid = el.get("element_id")
+        content = el.get("content")
+        if not eid or not isinstance(content, str):
+            continue
+        if old_map.get(eid) != content:
+            deltas[eid] = content
+    return deltas
 
 
 def _update_delay_seconds(last_update_at: Dict[str, float], event: SidecarEvent) -> float:

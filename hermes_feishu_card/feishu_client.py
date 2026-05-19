@@ -15,6 +15,11 @@ class FeishuAPIError(RuntimeError):
     pass
 
 
+class CardKitNotSupported(FeishuAPIError):
+    """Raised when CardKit v2.0 element update is not supported (e.g. old SDK)."""
+    pass
+
+
 @dataclass(frozen=True)
 class FeishuClientConfig:
     app_id: str
@@ -95,6 +100,39 @@ class FeishuClient:
             token=token,
             json_body={"content": content},
         )
+
+    async def update_card_element(
+        self, message_id: str, element_id: str, content: str
+    ) -> None:
+        """CardKit v2.0 增量更新：更新卡片中的某个元素。
+
+        POST /open-apis/im/v1/messages/{message_id}/update_card_element
+
+        只传变化的元素，不是整卡。如果飞书返回不支持（如旧版本），抛出
+        CardKitNotSupported 供调用方降级到 update_card_message()。
+        """
+        if not isinstance(message_id, str) or not message_id.strip():
+            raise ValueError("message_id is required")
+        if not isinstance(element_id, str) or not element_id.strip():
+            raise ValueError("element_id is required")
+        if not isinstance(content, str):
+            raise TypeError("content must be a string")
+        token = await self._tenant_token()
+        try:
+            await self._request_json(
+                "POST",
+                f"/im/v1/messages/{quote(message_id, safe='')}/update_card_element",
+                token=token,
+                json_body={
+                    "element_id": element_id,
+                    "content": content,
+                },
+            )
+        except FeishuAPIError as exc:
+            error_msg = str(exc)
+            if "not support" in error_msg.lower() or "unsupported" in error_msg.lower():
+                raise CardKitNotSupported(error_msg) from exc
+            raise
 
     async def _tenant_token(self) -> str:
         now = time.time()
