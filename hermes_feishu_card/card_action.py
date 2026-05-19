@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from typing import Any, Dict
 
 from aiohttp import web
@@ -128,7 +129,7 @@ def build_help_card(*, tab: str = "session") -> dict[str, Any]:
                             "tag": "button",
                             "text": {"tag": "plain_text", "content": "▶"},
                             "type": "default",
-                            "value": {"help_action": "help_cmd", "cmd": cmd_name.split()[0]},
+                            "value": {"help_action": "help_cmd", "cmd": re.sub(r'\s*[\[<][^\]>]*[\]>]', '', cmd_name).strip()},
                         },
                     ],
                 },
