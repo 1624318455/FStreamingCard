@@ -78,8 +78,10 @@ def create_app(
     app.router.add_get("/health", _health)
     app.router.add_get("/messages/{message_id}/summary", _message_summary)
     app.router.add_post("/events", _events)
-    app.router.add_post("/card_action", handle_card_action)
-    app.router.add_post("/help", _help)
+    help_card_cfg = card_config.get("help_card", {})
+    if help_card_cfg.get("enabled", False):
+        app.router.add_post("/card_action", handle_card_action)
+        app.router.add_post("/help", _help)
     return app
 
 

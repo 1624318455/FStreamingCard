@@ -43,6 +43,7 @@ def test_load_config_missing_file_returns_defaults(tmp_path):
                 "output_tokens",
                 "context",
             ],
+            "help_card": {"enabled": False},
         },
     }
 
@@ -90,6 +91,7 @@ card:
             "output_tokens",
             "context",
         ],
+        "help_card": {"enabled": False},
     }
 
 

@@ -2,6 +2,19 @@
 
 这些补丁是 FStreamingCard 对 Hermes Gateway `feishu.py` 的修改，使 `/help` 命令输出交互式卡片而非纯文字。
 
+**注意：这些补丁仅在启用 help card 功能时需要。** 纯流式卡片用户无需任何 gateway 修改。
+
+## 启用 Help Card
+
+1. 在 sidecar 配置中启用：
+   ```yaml
+   card:
+     help_card:
+       enabled: true
+   ```
+2. 应用下方的 gateway 补丁
+3. 重启网关：`hermes gateway restart`
+
 ## 补丁列表
 
 ### feishu_py_help_card.patch
@@ -33,3 +46,4 @@ hermes gateway restart
 - 这些补丁直接修改 Hermes 网关文件，不在 FStreamingCard 仓库的 git 管理中
 - 升级 Hermes 后需要重新应用补丁
 - 补丁基于 Hermes v0.14.x，其他版本可能需要调整行号
+- 默认配置下 help card 已禁用，不影响流式卡片功能

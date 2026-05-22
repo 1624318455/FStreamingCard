@@ -28,6 +28,7 @@ DEFAULT_CONFIG: dict[str, dict[str, Any]] = {
             "output_tokens",
             "context",
         ],
+        "help_card": {"enabled": False},
     },
 }
 KNOWN_SECTIONS = frozenset(DEFAULT_CONFIG)
