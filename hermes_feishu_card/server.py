@@ -3,9 +3,11 @@ from __future__ import annotations
 import os
 import time
 import asyncio
+import json
 import logging
 import re
 from typing import Any, Dict
+from urllib.parse import quote
 
 from aiohttp import web
 
@@ -34,8 +36,11 @@ FOOTER_FIELDS_KEY = web.AppKey("footer_fields", Any)
 CARD_TITLE_KEY = web.AppKey("card_title", str)
 BASE_CARD_CONFIG_KEY = web.AppKey("base_card_config", dict)
 LAST_CARD_KEY = web.AppKey("last_card", dict)
+CARD_IDS_KEY = web.AppKey("card_ids", dict)  # 新增: session_key -> card_id (CardKit v2.0 卡片实体ID)
+CARD_SEQUENCES_KEY = web.AppKey("card_sequences", dict)  # 新增: session_key -> int (流式更新序号)
 UPDATE_MAX_ATTEMPTS = 3
 UPDATE_MIN_INTERVAL_SECONDS = 0.5
+UPDATE_TASKS_KEY = web.AppKey("update_tasks", dict)  # 新增: session_key -> asyncio.Queue，串行化卡片更新
 TERMINAL_EVENTS = {"message.completed", "message.failed"}
 DIAGNOSTICS_KEY = web.AppKey("diagnostics", dict)
 PROFILE_ID_PATTERN = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
@@ -62,7 +67,10 @@ def create_app(
     app[METRICS_KEY] = SidecarMetrics()
     app[LAST_UPDATE_AT_KEY] = {}
     app[LAST_CARD_KEY] = {}
+    app[CARD_IDS_KEY] = {}  # CardKit card_id per session
+    app[CARD_SEQUENCES_KEY] = {}  # CardKit sequence counter per session
     app[MESSAGE_LOCKS_KEY] = {}
+    app[UPDATE_TASKS_KEY] = {}  # 新增: 卡片更新任务队列（per-session）
     app[DIAGNOSTICS_KEY] = {
         "last_update_error": "",
         "last_route_error": "",
@@ -227,6 +235,7 @@ async def _apply_event_locked(request: web.Request, event: SidecarEvent) -> tupl
             conversation_id=event.conversation_id,
             message_id=event.message_id,
             chat_id=event.chat_id,
+            show_reasoning=False,
         )
         sessions[_session_key(event)] = session
         applied = session.apply(event)
@@ -248,6 +257,7 @@ async def _apply_event_locked(request: web.Request, event: SidecarEvent) -> tupl
                 event.chat_id,
                 initial_card,
                 route.bot_id,
+                session_key=_session_key(event),
             )
             if message_id is None:
                 sessions.pop(_session_key(event), None)
@@ -260,6 +270,7 @@ async def _apply_event_locked(request: web.Request, event: SidecarEvent) -> tupl
             feishu_message_ids[_session_key(event)] = message_id
             message_bot_ids[_session_key(event)] = route.bot_id
             request.app[LAST_CARD_KEY][_session_key(event)] = initial_card
+            request.app[CARD_SEQUENCES_KEY][_session_key(event)] = 0  # CardKit 序号从 0 开始
         if applied:
             metrics.events_applied += 1
         else:
@@ -294,6 +305,7 @@ async def _apply_event_locked(request: web.Request, event: SidecarEvent) -> tupl
                     event.chat_id,
                     cron_card,
                     route.bot_id,
+                    session_key=_session_key(event),
                 )
                 if message_id is None:
                     sessions.pop(_session_key(event), None)
@@ -307,6 +319,7 @@ async def _apply_event_locked(request: web.Request, event: SidecarEvent) -> tupl
                 feishu_message_ids[_session_key(event)] = message_id
                 message_bot_ids[_session_key(event)] = route.bot_id
                 request.app[LAST_CARD_KEY][_session_key(event)] = cron_card
+                request.app[CARD_SEQUENCES_KEY][_session_key(event)] = 0
                 _store_card_summary(request.app, event, session, message_id)
                 request.app[DIAGNOSTICS_KEY]["last_terminal_event"] = {
                     "message_id": event.message_id,
@@ -350,23 +363,25 @@ async def _apply_event_locked(request: web.Request, event: SidecarEvent) -> tupl
         if should_update:
             # 锁内立即标记，防止后续事件在API完成前重复触发更新
             last_update_at[_session_key(event)] = time.monotonic()
-            card = _render_session_card(request, session)
             bot_id = message_bot_ids.get(_session_key(event))
             is_terminal = event.event in TERMINAL_EVENTS
+            _session_key_str = _session_key(event)  # 缓存避免重复调用
 
             async def _do_update():
                 if is_terminal:
                     delay = _update_delay_seconds(last_update_at, event)
                     if delay > 0:
                         await asyncio.sleep(delay)
+                # 运行时重新渲染卡片，避免闭包捕获过期快照导致的竞态
+                current_card = _render_session_card(request, session)
                 updated = await _update_card_for_app(
-                    request.app, feishu_message_id, card, bot_id,
-                    session_key=_session_key(event),
+                    request.app, feishu_message_id, current_card, bot_id,
+                    session_key=_session_key_str,
                 )
                 if not updated and is_terminal:
                     await _retry_terminal_update(
-                        request.app, feishu_message_id, card, bot_id,
-                        session_key=_session_key(event),
+                        request.app, feishu_message_id, current_card, bot_id,
+                        session_key=_session_key_str,
                     )
 
             post_lock_task = _do_update()
@@ -485,17 +500,33 @@ def _card_config_for_client(
 
 
 async def _send_card(
-    request: web.Request, chat_id: str, card: dict[str, Any], bot_id: str | None
+    request: web.Request, chat_id: str, card: dict[str, Any], bot_id: str | None,
+    session_key: str | None = None,
 ) -> str | None:
+    """发送卡片。优先使用 CardKit v2.0 实体创建+发送，降级到旧方式。"""
     metrics: SidecarMetrics = request.app[METRICS_KEY]
     metrics.feishu_send_attempts += 1
     try:
-        message_id = await _client_for_bot(request.app, bot_id).send_card(chat_id, card)
+        client = _client_for_bot(request.app, bot_id)
+        # CardKit v2.0: 创建卡片实体
+        card_id = await client.create_card_entity(card)
+        # 通过 card_id 发送消息
+        message_id = await client.send_card_entity(chat_id, card_id)
+        # 保存 card_id 到 session (如果有 session_key)
+        if session_key:
+            request.app[CARD_IDS_KEY][session_key] = card_id
+        metrics.feishu_send_successes += 1
+        return message_id
     except Exception:
-        metrics.feishu_send_failures += 1
-        return None
-    metrics.feishu_send_successes += 1
-    return message_id
+        # 降级：旧方式直接发送卡片 JSON
+        try:
+            client = _client_for_bot(request.app, bot_id)
+            message_id = await client.send_card(chat_id, card)
+            metrics.feishu_send_successes += 1
+            return message_id
+        except Exception:
+            metrics.feishu_send_failures += 1
+            return None
 
 
 async def _update_card(
@@ -509,25 +540,47 @@ async def _update_card_for_app(
     session_key: str | None = None,
 ) -> bool:
     metrics: SidecarMetrics = app[METRICS_KEY]
-    # Try element-level CardKit update first
-    if session_key:
+    card_id = app[CARD_IDS_KEY].get(session_key) if session_key else None
+    cardkit_ok = False
+
+    # CardKit v2.0: 流式更新文本元素（打字机效果）
+    if card_id and session_key:
         last_card = app[LAST_CARD_KEY].get(session_key)
         if last_card is not None:
             deltas = _compute_element_deltas(last_card, card)
             if deltas:
+                metrics.cardkit_deltas_found += 1
                 try:
                     client = _client_for_bot(app, bot_id)
+                    seq = app[CARD_SEQUENCES_KEY].get(session_key, 0) + 1
                     for element_id, content in deltas.items():
-                        await client.update_card_element(message_id, element_id, content)
+                        if element_id in ("tool_summary", "footer", "main_divider", "attachment_summary"):
+                            # content-only 更新用 put content；非文本元素跳过流式
+                            continue
+                        await client.streaming_update_text(card_id, element_id, content, seq)
+                        seq += 1
+                    app[CARD_SEQUENCES_KEY][session_key] = seq - 1
                     app[LAST_CARD_KEY][session_key] = card
-                    metrics.feishu_update_successes += 1
-                    return True
-                except CardKitNotSupported:
-                    logger.info("CardKit element update not supported, falling back to full card PATCH")
+                    metrics.cardkit_update_successes += 1
+                    cardkit_ok = True
                 except Exception as exc:
-                    message = _safe_update_error_message(bot_id, exc)
-                    logger.warning("CardKit element update failed: %s, falling back to full card PATCH", message)
-    # Fallback: full card PATCH
+                    metrics.cardkit_update_failures += 1
+                    logger.warning("CardKit streaming update failed: %s", exc)
+
+    # CardKit 整卡更新（PUT /cardkit/v1/cards/:card_id）
+    if not cardkit_ok and card_id:
+        try:
+            client = _client_for_bot(app, bot_id)
+            seq = app[CARD_SEQUENCES_KEY].get(session_key, 0) + 1
+            await client.update_card_entity(card_id, card, seq)
+            app[CARD_SEQUENCES_KEY][session_key] = seq
+            app[LAST_CARD_KEY][session_key] = card
+            metrics.feishu_update_successes += 1
+            return True
+        except Exception as exc:
+            logger.warning("CardKit full update failed, falling back to IM PATCH: %s", exc)
+
+    # 最终降级：IM PATCH 整卡替换
     for attempt in range(UPDATE_MAX_ATTEMPTS):
         if attempt > 0:
             metrics.feishu_update_retries += 1

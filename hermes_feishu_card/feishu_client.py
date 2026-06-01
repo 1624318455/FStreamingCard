@@ -101,6 +101,84 @@ class FeishuClient:
             json_body={"content": content},
         )
 
+    async def create_card_entity(self, card_json: Dict[str, Any]) -> str:
+        """CardKit v2.0: 创建卡片实体，返回 card_id。
+        
+        后续通过 card_id 发送消息和流式更新元素。
+        """
+        token = await self._tenant_token()
+        data_str = json.dumps(card_json, ensure_ascii=False)
+        body = await self._request_json(
+            "POST",
+            "/cardkit/v1/cards",
+            token=token,
+            json_body={"type": "card_json", "data": data_str},
+        )
+        card_id = body.get("data", {}).get("card_id")
+        if not isinstance(card_id, str) or not card_id:
+            raise FeishuAPIError("CardKit create card entity response missing card_id")
+        return card_id
+
+    async def send_card_entity(self, chat_id: str, card_id: str) -> str:
+        """CardKit v2.0: 通过 card_id 发送卡片消息，返回 message_id。"""
+        token = await self._tenant_token()
+        content_str = json.dumps(
+            {"type": "card", "data": {"card_id": card_id}},
+            ensure_ascii=False,
+        )
+        body = await self._request_json(
+            "POST",
+            "/im/v1/messages",
+            token=token,
+            params={"receive_id_type": "chat_id"},
+            json_body={
+                "receive_id": chat_id,
+                "msg_type": "interactive",
+                "content": content_str,
+            },
+        )
+        data = body.get("data")
+        if not isinstance(data, dict) or not isinstance(data.get("message_id"), str):
+            raise FeishuAPIError("Feishu send card entity response missing message_id")
+        return data["message_id"]
+
+    async def streaming_update_text(
+        self, card_id: str, element_id: str, content: str, sequence: int
+    ) -> None:
+        """CardKit v2.0: 流式更新文本元素（打字机效果）。
+        
+        PUT /cardkit/v1/cards/{card_id}/elements/{element_id}/content
+        传入全量文本，飞书自动计算增量并以打字机效果渲染。
+        sequence 必须严格递增。
+        """
+        token = await self._tenant_token()
+        await self._request_json(
+            "PUT",
+            f"/cardkit/v1/cards/{quote(card_id, safe='')}/elements/{quote(element_id, safe='')}/content",
+            token=token,
+            json_body={
+                "content": content,
+                "sequence": sequence,
+            },
+        )
+
+    async def update_card_entity(self, card_id: str, card_json: Dict[str, Any], sequence: int) -> None:
+        """CardKit v2.0: 全量更新卡片实体（整卡替换）。
+        
+        PUT /cardkit/v1/cards/{card_id}
+        当流式文本更新失败时降级使用。
+        """
+        token = await self._tenant_token()
+        await self._request_json(
+            "PUT",
+            f"/cardkit/v1/cards/{quote(card_id, safe='')}",
+            token=token,
+            json_body={
+                "card": {"data": json.dumps(card_json, ensure_ascii=False)},
+                "sequence": sequence,
+            },
+        )
+
     async def update_card_element(
         self, message_id: str, element_id: str, content: str
     ) -> None:

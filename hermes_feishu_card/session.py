@@ -20,6 +20,7 @@ class CardSession:
     conversation_id: str
     message_id: str
     chat_id: str
+    show_reasoning: bool = True
     status: str = "thinking"
     last_sequence: int = -1
     thinking_text: str = ""
@@ -46,6 +47,8 @@ class CardSession:
             return self.answer_text
         if self.answer_text:
             return self.answer_text
+        if not self.show_reasoning:
+            return "正在思考..."
         return self.thinking_text
 
     def apply(self, event: SidecarEvent) -> bool:
@@ -63,7 +66,8 @@ class CardSession:
         self.last_sequence = max(self.last_sequence, event.sequence)
 
         if event.event == "thinking.delta":
-            self.thinking_text += self.thinking_normalizer.feed(str(event.data.get("text", "")))
+            if self.show_reasoning:
+                self.thinking_text += self.thinking_normalizer.feed(str(event.data.get("text", "")))
         elif event.event == "answer.delta":
             self.answer_text += self.answer_normalizer.feed(str(event.data.get("text", "")))
         elif event.event == "tool.updated":

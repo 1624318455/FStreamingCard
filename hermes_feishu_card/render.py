@@ -52,8 +52,14 @@ def render_card(
     return {
         "schema": "2.0",
         "config": {
+            "streaming_mode": True,
             "update_multi": True,
             "summary": {"content": status["subtitle"]},
+            "streaming_config": {
+                "print_frequency_ms": {"default": 50},
+                "print_step": {"default": 4},
+                "print_strategy": "fast",
+            },
         },
         "header": {
             "template": status["template"],

@@ -42,6 +42,7 @@ class RuntimeConfig:
 
 
 _SEQUENCES: dict[str, int] = {}
+_SEQUENCE_LOCK = threading.Lock()  # 新增: 保护 _SEQUENCES 并发访问
 _ACTIVE_FALLBACK_MESSAGE_IDS: dict[tuple[str, str, str | None], str] = {}
 _CURRENT_FALLBACK_KEYS: dict[tuple[str, str], tuple[str, str, str | None]] = {}
 _FALLBACK_LIFECYCLE_COUNTS: dict[tuple[str, str], int] = {}
@@ -921,10 +922,12 @@ def _hash_fallback_message_id(
 
 
 def _next_sequence(message_id: str) -> int:
-    sequence = _SEQUENCES.get(message_id, -1) + 1
-    _SEQUENCES[message_id] = sequence
+    with _SEQUENCE_LOCK:
+        sequence = _SEQUENCES.get(message_id, -1) + 1
+        _SEQUENCES[message_id] = sequence
     return sequence
 
 
 def _peek_next_sequence(message_id: str) -> int:
-    return _SEQUENCES.get(message_id, -1) + 1
+    with _SEQUENCE_LOCK:
+        return _SEQUENCES.get(message_id, -1) + 1
